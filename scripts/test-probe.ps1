@@ -27,7 +27,7 @@ function Run-Probe([string]$Name,[string[]]$Arguments,[int]$ExpectedExit) {
         if($process.ExitCode -ne $ExpectedExit){throw "$Name returned $($process.ExitCode), expected $ExpectedExit"}
     } finally {$process.Dispose()}
     if(-not (Test-Path -LiteralPath $out -PathType Leaf)){throw "$Name did not create a report"}
-    $report=Get-Content -LiteralPath $out -Raw | ConvertFrom-Json
+    $report=Get-Content -LiteralPath $out -Raw | ConvertFrom-Json -NoEnumerate
     if($report -isnot [pscustomobject]){throw "$Name did not return a JSON object"}
     if(-not (Is-JsonNumber $report.schema_version) -or $report.schema_version -ne 1){throw "$Name schema mismatch"}
     return $report
@@ -35,6 +35,9 @@ function Run-Probe([string]$Name,[string[]]$Arguments,[int]$ExpectedExit) {
 $valid=Run-Probe 'valid' @('--seconds','6') 0
 if($valid.status -cne 'completed' -or $valid.mode -cne 'passive_telemetry_probe'){throw 'Probe mode/status mismatch'}
 if(-not (Is-JsonNumber $valid.requested_duration_seconds) -or $valid.requested_duration_seconds -ne 6){throw 'Probe did not record the requested duration'}
+foreach($field in @('validation','last_snapshot','support_status')){
+    if($valid.$field -isnot [pscustomobject]){throw "Missing probe object: $field"}
+}
 foreach($condition in @('sequence_advanced','cpu_has_valid_sample','ram_has_valid_sample','memory_used_not_above_total')){
     $result=$valid.validation.$condition
     if($result -isnot [bool] -or -not $result){throw "Probe invariant failed: $condition"}
@@ -55,6 +58,8 @@ $states=[ordered]@{}
 foreach($metric in @('cpu','ram','gpu','disk','npu','fan')) {
     $sample=$valid.last_snapshot.$metric
     if($sample -isnot [pscustomobject] -or $knownStates -cnotcontains $sample.state){throw "Unknown metric state: $metric"}
+    $unit=if($metric -ceq 'fan'){'rpm'}else{'percent'}
+    if($sample.unit -cne $unit){throw "Unexpected metric unit: $metric"}
     if($valid.support_status.$metric -cne $sample.state){throw "Inconsistent support state: $metric"}
     $states[$metric]=$sample.state
     if($sample.state -ceq 'ready'){

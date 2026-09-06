@@ -3,7 +3,7 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 $projectDir = Split-Path $PSScriptRoot -Parent
 function Normalize-Path([string]$Path) {
-    return [IO.Path]::TrimEndingDirectorySeparator($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path))
+    return [IO.Path]::TrimEndingDirectorySeparator([IO.Path]::GetFullPath($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)))
 }
 function Same-Or-Descendant([string]$Candidate,[string]$Ancestor) {
     if($Candidate.Equals($Ancestor,[StringComparison]::OrdinalIgnoreCase)){return $true}

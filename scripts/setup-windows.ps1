@@ -41,12 +41,12 @@ if($env:GITHUB_ENV){
     "CARGO_ENCODED_RUSTFLAGS=$env:CARGO_ENCODED_RUSTFLAGS" | Out-File -LiteralPath $env:GITHUB_ENV -Append -Encoding utf8
 }
 if($Installer){
-    $installer=Get-VerifiedFile 'https://github.com/jrsoftware/issrc/releases/download/is-7_1_0/innosetup-7.1.0-x64.exe' 'innosetup.exe' '0362A383ED217D4C4239B5933866DD96D3EB2102737DA92F80F6057A4B40DF2F'
-    $signature=Get-AuthenticodeSignature -LiteralPath $installer
+    $installerDownload=Get-VerifiedFile 'https://github.com/jrsoftware/issrc/releases/download/is-7_1_0/innosetup-7.1.0-x64.exe' 'innosetup.exe' '0362A383ED217D4C4239B5933866DD96D3EB2102737DA92F80F6057A4B40DF2F'
+    $signature=Get-AuthenticodeSignature -LiteralPath $installerDownload
     if($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch 'Pyrsys B.V.'){throw 'Inno Setup publisher verification failed'}
     $destination=Join-Path $toolsPath 'inno-7'
     if(-not (Test-Path -LiteralPath (Join-Path $destination 'ISCC.exe'))){
-        $process=Start-Process -FilePath $installer -ArgumentList @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/SP-','/CURRENTUSER','/PORTABLE=1','/NOICONS',('/DIR="'+$destination+'"')) -WindowStyle Hidden -Wait -PassThru
+        $process=Start-Process -FilePath $installerDownload -ArgumentList @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/SP-','/CURRENTUSER','/PORTABLE=1','/NOICONS',('/DIR="'+$destination+'"')) -WindowStyle Hidden -Wait -PassThru
         if($process.ExitCode -ne 0){throw 'Portable Inno Setup preparation failed'}
     }
     $env:INNO_COMPILER=Join-Path $destination 'ISCC.exe'

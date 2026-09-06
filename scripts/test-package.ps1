@@ -147,7 +147,8 @@ $setupPath = Join-Path $ReleaseDir $setupName
 if (-not (Test-Path -LiteralPath $setupPath -PathType Leaf)) {
     throw 'Missing Setup executable'
 }
-if ((Get-Item -LiteralPath $setupPath).VersionInfo.ProductVersion -ne $version) {
+# Inno Setup pads the version resource with spaces for its installer template.
+if ((Get-Item -LiteralPath $setupPath).VersionInfo.ProductVersion.Trim() -ne $version) {
     throw 'Setup executable version differs from Cargo'
 }
 Add-Type -AssemblyName System.IO.Compression.FileSystem
