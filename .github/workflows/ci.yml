@@ -1,0 +1,112 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '17 2 * * 0'
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  release-policy:
+    name: Release policy tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Reject unverified release sources and findings
+        run: python -m unittest discover -s scripts -p test_release_gate.py -v
+  windows:
+    name: Windows (${{ matrix.os }}, ${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+            package: false
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+            package: false
+          - os: windows-2025
+            target: x86_64-pc-windows-gnu
+            package: true
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Prepare verified tools
+        env:
+          BUILD_TARGET: ${{ matrix.target }}
+          BUILD_PACKAGE: ${{ matrix.package }}
+        run: ./scripts/setup-windows.ps1 -Target $env:BUILD_TARGET -Installer:($env:BUILD_PACKAGE -eq 'true')
+      - name: Format and compile-time lint gates
+        run: |
+          cargo fmt --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo clippy --locked --all-targets -- -D clippy::correctness -D clippy::suspicious
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Regression and defensive input tests
+        run: |
+          cargo test --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Build the release executable
+        run: |
+          cargo build --release --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Passive process smoke tests
+        env:
+          BUILD_TARGET: ${{ matrix.target }}
+        run: ./scripts/test-probe.ps1 -Executable "target/$env:BUILD_TARGET/release/taskbar-monitor.exe"
+      - name: Build and validate distribution
+        if: matrix.package
+        env:
+          BUILD_TARGET: ${{ matrix.target }}
+        run: |
+          ./packaging/build-release.ps1 -InnoCompiler $env:INNO_COMPILER -PayloadDir target/payload -ReleaseDir dist -ExecutablePath "target/$env:BUILD_TARGET/release/taskbar-monitor.exe" -SkipBuild
+          ./scripts/test-package.ps1 -ReleaseDir dist -PayloadDir target/payload
+          ./scripts/test-installer.ps1 -ReleaseDir dist
+      - name: Save sanitized test summary
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: summary-${{ matrix.os }}-${{ matrix.target }}
+          path: target/probe-tests/summary.json
+          if-no-files-found: ignore
+          retention-days: 14
+      - name: Save tested release candidate
+        if: matrix.package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: candidate-${{ github.sha }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+  required:
+    name: Required CI
+    if: always()
+    needs: [windows, release-policy]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: Require every matrix result
+        env:
+          MATRIX_RESULT: ${{ needs.windows.result }}
+          POLICY_RESULT: ${{ needs.release-policy.result }}
+        run: test "$MATRIX_RESULT" = success && test "$POLICY_RESULT" = success

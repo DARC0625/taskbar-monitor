@@ -52,7 +52,10 @@ impl Config {
         }
     }
     pub fn width(&self) -> i32 {
-        (self.visible.iter().filter(|v| **v).count() as u32 * self.column_dip + 8) as i32
+        // Public fields can be edited before normalize() is called. Geometry must
+        // remain valid even during that transition, including an all-hidden config.
+        let columns = self.visible.iter().filter(|v| **v).count().max(1) as u32;
+        (columns * self.column_dip.clamp(88, 116) + 8) as i32
     }
     pub fn save(&self) -> io::Result<()> {
         save_at(self, &Self::path(), true)
@@ -124,6 +127,12 @@ fn resolve_paths() -> ConfigPaths {
 }
 
 fn decode(bytes: &[u8]) -> Option<Config> {
+    // Settings use a named JSON object, never Serde's positional struct sequence.
+    if bytes.len() as u64 > MAX_CONFIG_BYTES
+        || bytes.iter().find(|byte| !byte.is_ascii_whitespace()) != Some(&b'{')
+    {
+        return None;
+    }
     let mut value: Config = serde_json::from_slice(bytes).ok()?;
     value.normalize();
     Some(value)
@@ -173,7 +182,10 @@ fn load_from_paths(paths: &ConfigPaths) -> Config {
 }
 
 fn save_at(value: &Config, destination: &Path, replace_existing: bool) -> io::Result<()> {
-    let bytes = serde_json::to_vec_pretty(value)?;
+    // A save must not create a file that our bounded reader cannot load again.
+    let mut normalized = value.clone();
+    normalized.normalize();
+    let bytes = serde_json::to_vec_pretty(&normalized)?;
     atomic_write(destination, &bytes, replace_existing)
 }
 
@@ -397,6 +409,65 @@ mod tests {
     }
 
     #[test]
+    fn invalid_json_shapes_numbers_and_truncated_files_are_rejected() {
+        let invalid: &[&[u8]] = &[
+            b"",
+            b"null",
+            b"true",
+            b"[]",
+            b"[\"dark\",12,96,[true,true,true,true,true,true],\"hud\"]",
+            br#"{"column_dip":-1}"#,
+            br#"{"column_dip":4294967296}"#,
+            br#"{"offset_dip":2147483648}"#,
+            br#"{"offset_dip":-2147483649}"#,
+            br#"{"column_dip":1.5}"#,
+            br#"{"column_dip":1e999}"#,
+            br#"{"column_dip":NaN}"#,
+            br#"{"column_dip":Infinity}"#,
+            br#"{"theme":null}"#,
+            br#"{"visible":[true]}"#,
+            br#"{"visible":[true,true,true,true,true,true,false]}"#,
+            br#"{"theme":"dark","theme":"light"}"#,
+            b"{} trailing",
+            b"{\"theme\":\"\xff\"}",
+        ];
+        for bytes in invalid {
+            assert!(decode(bytes).is_none(), "invalid input accepted: {bytes:?}");
+        }
+        let valid = br#"{"theme":"dark","visible":[true,false,true,false,true,false]}"#;
+        for end in 0..valid.len() {
+            assert!(decode(&valid[..end]).is_none(), "truncated prefix {end}");
+        }
+        assert_eq!(decode(valid).unwrap().theme, "dark");
+        // Named future fields remain forward compatible, and omitted fields default.
+        let future = decode(br#"{"theme":"light","future":{"version":2}}"#).unwrap();
+        assert_eq!(future.theme, "light");
+        assert_eq!(future.column_dip, Config::default().column_dip);
+    }
+
+    #[test]
+    fn geometry_is_bounded_before_normalization_and_normalization_is_idempotent() {
+        for mask in 0u8..64 {
+            for column in [0, 87, 88, 116, 117, u32::MAX] {
+                let mut value = Config {
+                    column_dip: column,
+                    offset_dip: if mask % 2 == 0 { i32::MIN } else { i32::MAX },
+                    visible: std::array::from_fn(|index| mask & (1 << index) != 0),
+                    ..Config::default()
+                };
+                let raw_width = value.width();
+                assert!((96..=704).contains(&raw_width));
+                value.normalize();
+                assert_eq!(value.width(), raw_width);
+                assert!((0..=16000).contains(&value.offset_dip));
+                let once = serde_json::to_value(&value).unwrap();
+                value.normalize();
+                assert_eq!(serde_json::to_value(&value).unwrap(), once);
+            }
+        }
+    }
+
+    #[test]
     fn path_selection_requires_explicit_portable_flag() {
         let install = Path::new("install");
         let app_data = Path::new("user-data").join(APP_DIRECTORY);
@@ -424,6 +495,65 @@ mod tests {
         assert_eq!(restored.theme, "light");
         assert_eq!(restored.offset_dip, 47);
         assert_eq!(fs::read_dir(path.parent().unwrap()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn save_normalizes_public_fields_into_a_readable_bounded_file() {
+        let directory = TestDirectory::new();
+        let path = directory.0.join(CONFIG_FILE);
+        let value = Config {
+            theme: "x".repeat(MAX_CONFIG_BYTES as usize),
+            offset_dip: i32::MIN,
+            column_dip: u32::MAX,
+            visible: [false; 6],
+            style: "invalid".into(),
+        };
+        save_at(&value, &path, true).unwrap();
+        let restored = decode(&read_config(&path).unwrap()).unwrap();
+        assert_eq!(restored.theme, "auto");
+        assert_eq!(restored.width(), 124);
+        assert_eq!(restored.offset_dip, 0);
+        assert!(fs::metadata(&path).unwrap().len() < MAX_CONFIG_BYTES);
+    }
+
+    #[test]
+    fn size_limit_accepts_the_boundary_and_never_migrates_over_oversized_data() {
+        let directory = TestDirectory::new();
+        let destination = directory.0.join(CONFIG_FILE);
+        let legacy = directory.0.join("legacy.json");
+        fs::write(&legacy, br#"{"theme":"light"}"#).unwrap();
+        let mut bytes = br#"{"theme":"dark"}"#.to_vec();
+        bytes.resize(MAX_CONFIG_BYTES as usize, b' ');
+        fs::write(&destination, &bytes).unwrap();
+        assert_eq!(
+            decode(&read_config(&destination).unwrap()).unwrap().theme,
+            "dark"
+        );
+        bytes.push(b' ');
+        fs::write(&destination, &bytes).unwrap();
+        assert_eq!(
+            read_config(&destination).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert!(decode(&bytes).is_none());
+        let paths = ConfigPaths {
+            destination: destination.clone(),
+            legacy: Some(legacy),
+        };
+        assert_eq!(load_from_paths(&paths).theme, "auto");
+        assert_eq!(fs::read(destination).unwrap(), bytes);
+        assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn migration_no_replace_preserves_the_existing_winner_and_cleans_its_temp() {
+        let directory = TestDirectory::new();
+        let destination = directory.0.join(CONFIG_FILE);
+        let winner = br#"{"theme":"dark","offset_dip":57}"#;
+        fs::write(&destination, winner).unwrap();
+        assert!(save_at(&Config::default(), &destination, false).is_err());
+        assert_eq!(fs::read(destination).unwrap(), winner);
+        assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 1);
     }
 
     #[test]
@@ -495,5 +625,33 @@ mod tests {
         assert_eq!(decode(&read_config(&path).unwrap()).unwrap().theme, "dark");
         assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 1);
         drop(lock);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn inaccessible_installed_config_does_not_fall_back_to_or_overwrite_legacy() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let directory = TestDirectory::new();
+        let destination = directory.0.join(CONFIG_FILE);
+        let legacy = directory.0.join("legacy.json");
+        let original = br#"{"theme":"dark"}"#;
+        fs::write(&destination, original).unwrap();
+        fs::write(&legacy, br#"{"theme":"light"}"#).unwrap();
+        // A handle on our own temporary file gives a deterministic sharing denial
+        // without changing process credentials, user ACLs, or global environment.
+        let lock = OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&destination)
+            .unwrap();
+        let paths = ConfigPaths {
+            destination: destination.clone(),
+            legacy: Some(legacy),
+        };
+        assert!(read_config(&destination).is_err());
+        assert_eq!(load_from_paths(&paths).theme, "auto");
+        drop(lock);
+        assert_eq!(fs::read(destination).unwrap(), original);
+        assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 2);
     }
 }
