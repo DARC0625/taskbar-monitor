@@ -223,7 +223,9 @@ fn state_code(state: MetricState) -> &'static str {
 }
 
 fn metric_json(metric: &Metric, now: Instant, unit: &str) -> Value {
-    let finite_value = metric.value.filter(|value| value.is_finite());
+    let finite_value = metric
+        .value
+        .filter(|value| value.is_finite() && *value >= 0.0);
     json!({
         "state": state_code(metric.state),
         "state_label": metric.state.label(),
@@ -259,7 +261,7 @@ struct SampleRange {
     count: u64,
     min: Option<f64>,
     max: Option<f64>,
-    sum: f64,
+    mean: f64,
     last_seen: Option<Instant>,
     invalid_ready_observations: u64,
     states: BTreeMap<&'static str, u64>,
@@ -278,12 +280,14 @@ impl SampleRange {
             self.invalid_ready_observations += 1;
             return;
         };
-        if self.last_seen == Some(metric.sampled_at) {
+        if self.last_seen.is_some_and(|last| metric.sampled_at <= last) {
             return;
         }
         self.last_seen = Some(metric.sampled_at);
         self.count += 1;
-        self.sum += value;
+        // Values are nonnegative, so this running mean cannot overflow when a
+        // finite throughput sample is large. Summing first could become infinity.
+        self.mean += (value - self.mean) / self.count as f64;
         self.min = Some(self.min.map_or(value, |min| min.min(value)));
         self.max = Some(self.max.map_or(value, |max| max.max(value)));
     }
@@ -294,7 +298,7 @@ impl SampleRange {
             "unique_ready_samples": self.count,
             "min": self.min,
             "max": self.max,
-            "mean": if self.count > 0 { Some(self.sum / self.count as f64) } else { None },
+            "mean": if self.count > 0 { Some(self.mean) } else { None },
             "invalid_ready_observations": self.invalid_ready_observations,
             "state_observations": self.states,
         })
@@ -362,10 +366,15 @@ fn normalized_cpu_percent(
     wall_seconds: f64,
     logical_processors: u32,
 ) -> Option<f64> {
-    if logical_processors == 0 || wall_seconds <= 0.0 {
+    if logical_processors == 0
+        || !cpu_seconds.is_finite()
+        || cpu_seconds < 0.0
+        || !wall_seconds.is_finite()
+        || wall_seconds <= 0.0
+    {
         return None;
     }
-    let value = 100.0 * cpu_seconds / wall_seconds / f64::from(logical_processors);
+    let value = (cpu_seconds / wall_seconds) / f64::from(logical_processors) * 100.0;
     value.is_finite().then_some(value)
 }
 
@@ -595,10 +604,96 @@ mod tests {
     }
 
     #[test]
+    fn replayed_or_out_of_order_samples_do_not_bias_unique_sample_statistics() {
+        let mut range = SampleRange::default();
+        let start = Instant::now();
+        let first = ready(10.0, start);
+        range.observe(&first);
+        range.observe(&ready(30.0, start + Duration::from_secs(1)));
+        range.observe(&first);
+        range.observe(&ready(50.0, start + Duration::from_secs(2)));
+        assert_eq!(range.count, 3);
+        assert_eq!(range.states["ready"], 4);
+        let report = range.to_json("percent");
+        assert_eq!(report["min"], 10.0);
+        assert_eq!(report["max"], 50.0);
+        assert_eq!(report["mean"], 30.0);
+    }
+
+    #[test]
+    fn finite_large_samples_keep_a_finite_mean_in_json() {
+        let mut range = SampleRange::default();
+        let start = Instant::now();
+        range.observe(&ready(f64::MAX, start));
+        range.observe(&ready(f64::MAX, start + Duration::from_secs(1)));
+        let report = range.to_json("bytes_per_second");
+        assert_eq!(report["unique_ready_samples"], 2);
+        assert_eq!(report["mean"].as_f64(), Some(f64::MAX));
+        assert!(report["mean"].as_f64().unwrap().is_finite());
+        // Large rates are representable, but the same values cannot validate as percentages.
+        assert_eq!(range.valid_percentage(), Some(false));
+    }
+
+    #[test]
+    fn invalid_ready_values_are_reported_without_becoming_measurements() {
+        let start = Instant::now();
+        let mut range = SampleRange::default();
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0] {
+            let metric = ready(value, start);
+            range.observe(&metric);
+            let report = metric_json(&metric, start, "percent");
+            assert!(report["value"].is_null());
+            assert!(report["last_value"].is_null());
+        }
+        let mut missing_ready = ready(0.0, start);
+        missing_ready.value = None;
+        range.observe(&missing_ready);
+        assert_eq!(range.count, 0);
+        assert_eq!(range.invalid_ready_observations, 5);
+        assert_eq!(range.valid_percentage(), Some(false));
+        range.observe(&ready(0.0, start + Duration::from_secs(1)));
+        assert_eq!(range.count, 1);
+        assert_eq!(range.to_json("percent")["mean"], 0.0);
+    }
+
+    #[test]
+    fn unavailable_states_never_serialize_retained_values_as_current_readings() {
+        let now = Instant::now();
+        for state in [
+            MetricState::WarmingUp,
+            MetricState::NotPresent,
+            MetricState::Unsupported,
+            MetricState::Error,
+            MetricState::Stale,
+        ] {
+            let mut metric = ready(42.0, now + Duration::from_secs(1));
+            metric.state = state;
+            let report = metric_json(&metric, now, "percent");
+            assert!(report["value"].is_null());
+            assert_eq!(report["last_value"], 42.0);
+            assert_eq!(report["sample_age_ms"], 0.0);
+            let mut range = SampleRange::default();
+            range.observe(&metric);
+            assert_eq!(range.count, 0);
+            assert_eq!(range.valid_percentage(), None);
+            assert!(range.to_json("percent")["mean"].is_null());
+        }
+    }
+
+    #[test]
     fn cpu_percentage_is_normalized_to_all_logical_processors() {
         assert_eq!(normalized_cpu_percent(2.0, 10.0, 8), Some(2.5));
         assert_eq!(normalized_cpu_percent(2.0, 0.0, 8), None);
         assert_eq!(normalized_cpu_percent(2.0, 10.0, 0), None);
+        for cpu_seconds in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0] {
+            assert_eq!(normalized_cpu_percent(cpu_seconds, 10.0, 8), None);
+        }
+        for wall_seconds in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0, 0.0] {
+            assert_eq!(normalized_cpu_percent(1.0, wall_seconds, 8), None);
+        }
+        assert_eq!(normalized_cpu_percent(0.0, 10.0, 8), Some(0.0));
+        assert_eq!(normalized_cpu_percent(f64::MAX, f64::MAX, 1), Some(100.0));
+        assert_eq!(normalized_cpu_percent(f64::MAX, 1.0, 1), None);
     }
 
     #[test]

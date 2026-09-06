@@ -1,0 +1,73 @@
+name: Security
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '23 2 * * 1'
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  dependency-audit:
+    name: Dependency audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      AUDIT_VERSION: '0.22.2'
+      RUST_TOOLCHAIN: '1.98.1'
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install pinned audit tool
+        shell: bash
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          cargo +"$RUST_TOOLCHAIN" install cargo-audit --version "$AUDIT_VERSION" --locked --no-default-features --root "$RUNNER_TEMP/audit-tools"
+      - name: Audit committed dependencies
+        shell: bash
+        run: |
+          test -f Cargo.lock
+          "$RUNNER_TEMP/audit-tools/bin/cargo-audit" audit --file Cargo.lock --deny warnings
+          git diff --exit-code -- Cargo.toml Cargo.lock
+
+  codeql:
+    name: CodeQL
+    runs-on: windows-2022
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust toolchain
+        shell: pwsh
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustup override set 1.98.1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Initialize Rust analysis
+        uses: github/codeql-action/init@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
+        with:
+          languages: rust
+          build-mode: none
+          queries: security-extended
+          dependency-caching: false
+      - name: Analyze Rust source
+        uses: github/codeql-action/analyze@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
+        with:
+          category: /language:rust

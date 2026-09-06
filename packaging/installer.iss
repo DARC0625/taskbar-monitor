@@ -19,7 +19,7 @@
   #error "Pass /DReleaseDir=<absolute installer output directory>"
 #endif
 #ifndef AppVersion
-  #define AppVersion "0.4.0"
+  #error "Pass /DAppVersion=<Cargo.toml version> (or use build-release.ps1)"
 #endif
 
 #define AppName "Taskbar Monitor"

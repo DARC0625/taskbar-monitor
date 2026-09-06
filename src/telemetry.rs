@@ -291,6 +291,22 @@ fn with_snapshot(shared: &Mutex<Snapshot>, update: impl FnOnce(&mut Snapshot)) {
     snapshot.sequence = snapshot.sequence.wrapping_add(1);
 }
 
+/// A discarded pre-reset result is not a published sample or a sequence advance.
+fn commit_generation(
+    shared: &Mutex<Snapshot>,
+    generation: &AtomicU64,
+    expected_generation: u64,
+    update: impl FnOnce(&mut Snapshot),
+) -> bool {
+    let mut snapshot = shared.lock().unwrap_or_else(|e| e.into_inner());
+    if generation.load(Ordering::Acquire) != expected_generation {
+        return false;
+    }
+    update(&mut snapshot);
+    snapshot.sequence = snapshot.sequence.wrapping_add(1);
+    true
+}
+
 fn notify_changed(notify: &Notification) {
     let callback = notify.lock().unwrap_or_else(|e| e.into_inner()).clone();
     if let Some(callback) = callback {
@@ -417,10 +433,7 @@ fn fast_worker(
             }
         };
         let memory = native::physical_memory();
-        with_snapshot(&shared, |snapshot| {
-            if generation.load(Ordering::Acquire) != observed_generation {
-                return;
-            }
+        let committed = commit_generation(&shared, &generation, observed_generation, |snapshot| {
             snapshot.cpu = cpu;
             match memory {
                 Ok((total, available)) => match memory_percent(total, available) {
@@ -448,7 +461,9 @@ fn fast_worker(
                 }
             }
         });
-        notify_changed(&notify);
+        if committed {
+            notify_changed(&notify);
+        }
         thread::park_timeout(FAST_INTERVAL.saturating_sub(started.elapsed()));
     }
 }
@@ -479,10 +494,7 @@ fn slow_worker(
         }
         previous_tick = started;
         let sample = providers.sample();
-        with_snapshot(&shared, |snapshot| {
-            if generation.load(Ordering::Acquire) != observed_generation {
-                return;
-            }
+        let committed = commit_generation(&shared, &generation, observed_generation, |snapshot| {
             snapshot.gpu = sample.gpu;
             snapshot.disk = sample.disk;
             snapshot.npu = sample.npu;
@@ -490,7 +502,9 @@ fn slow_worker(
             snapshot.disk_write_bytes_sec = sample.write;
             snapshot.gpu_adapter = sample.gpu_adapter;
         });
-        notify_changed(&notify);
+        if committed {
+            notify_changed(&notify);
+        }
         thread::park_timeout(SLOW_INTERVAL.saturating_sub(started.elapsed()));
     }
 }
@@ -533,6 +547,44 @@ mod tests {
             ),
             None
         );
+        let zero = CpuTimes {
+            idle: 0,
+            kernel: 0,
+            user: 0,
+        };
+        assert_eq!(
+            cpu_busy(
+                zero,
+                CpuTimes {
+                    idle: 0,
+                    kernel: u64::MAX,
+                    user: 1
+                }
+            ),
+            None
+        );
+        assert_eq!(
+            cpu_busy(
+                zero,
+                CpuTimes {
+                    idle: u64::MAX,
+                    kernel: u64::MAX,
+                    user: 0
+                }
+            ),
+            Some(0.0)
+        );
+        assert_eq!(
+            cpu_busy(
+                zero,
+                CpuTimes {
+                    idle: 0,
+                    kernel: u64::MAX,
+                    user: 0
+                }
+            ),
+            Some(100.0)
+        );
         assert_eq!(
             cpu_busy(
                 first,
@@ -551,6 +603,8 @@ mod tests {
         assert_eq!(memory_percent(1_000, 250), Some((750, 75.0)));
         assert_eq!(memory_percent(0, 0), None);
         assert_eq!(memory_percent(100, 101), None);
+        assert_eq!(memory_percent(u64::MAX, u64::MAX), Some((0, 0.0)));
+        assert_eq!(memory_percent(u64::MAX, 0), Some((u64::MAX, 100.0)));
     }
 
     #[test]
@@ -563,6 +617,15 @@ mod tests {
         assert_eq!(engine_busy(500, 0, Duration::from_secs(1)), None);
         assert_eq!(engine_busy(0, 500, Duration::ZERO), None);
         assert_eq!(engine_busy(0, 500, Duration::from_secs(30)), None);
+        assert_eq!(engine_busy(0, 3_000_000, RESUME_GAP), Some(100.0));
+        assert_eq!(
+            engine_busy(0, 3_000_000, RESUME_GAP + Duration::from_nanos(1)),
+            None
+        );
+        assert_eq!(
+            engine_busy(0, u64::MAX, Duration::from_nanos(1)),
+            Some(100.0)
+        );
     }
 
     #[test]
@@ -599,20 +662,145 @@ mod tests {
     }
 
     #[test]
+    fn bad_provider_values_cannot_become_ready_samples_or_poison_valid_devices() {
+        let engine = "pid_1_luid_a_b_phys_0_eng_0_engtype_3D".to_owned();
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0] {
+            let reading = Metric::reading(value, "test", FAST_INTERVAL, "invalid input");
+            assert_eq!(reading.state, MetricState::Error);
+            assert_eq!(reading.value, None);
+            assert_eq!(busiest_engine(&[(engine.clone(), value)]), None);
+            assert_eq!(busiest_disk(&[("0 C:".into(), value)]), None);
+            let valid_engine =
+                busiest_engine(&[(engine.clone(), value), (engine.clone(), 25.0)]).unwrap();
+            assert_eq!(valid_engine.1, 25.0);
+            assert_eq!(
+                busiest_disk(&[("0 C:".into(), value), ("1 D:".into(), 75.0)]),
+                Some(("1 D:".into(), 25.0))
+            );
+        }
+        let zero = Metric::reading(0.0, "test", FAST_INTERVAL, "idle is a valid measurement");
+        assert_eq!(zero.state, MetricState::Ready);
+        assert_eq!(zero.value, Some(0.0));
+        assert!(busiest_disk(&[("_Total".into(), 0.0)]).is_none());
+        // Finite extreme counters are bounded before they leave the aggregator.
+        assert_eq!(
+            busiest_engine(&[(engine.clone(), f64::MAX), (engine, f64::MAX)])
+                .unwrap()
+                .1,
+            100.0
+        );
+    }
+
+    #[test]
+    fn reset_rejects_old_worker_results_without_fabricating_sequence_progress() {
+        // No workers or Windows providers are started: publication order is driven
+        // explicitly so this regression does not depend on scheduler timing.
+        let ready = Metric::reading(73.0, "test", SLOW_INTERVAL, "old baseline");
+        let telemetry = Telemetry {
+            shared: Arc::new(Mutex::new(Snapshot {
+                cpu: ready.clone(),
+                gpu: ready.clone(),
+                disk: ready.clone(),
+                npu: ready.clone(),
+                disk_read_bytes_sec: ready.clone(),
+                disk_write_bytes_sec: ready,
+                ram: Metric::reading(40.0, "memory", Duration::ZERO, "point reading"),
+                sequence: 20,
+                ..Snapshot::default()
+            })),
+            generation: Arc::new(AtomicU64::new(7)),
+            stop: Arc::new(AtomicBool::new(false)),
+            notify: Arc::new(Mutex::new(None)),
+            workers: Vec::new(),
+        };
+        let notified = Arc::new(AtomicU64::new(0));
+        let callback_count = notified.clone();
+        let shared = telemetry.shared.clone();
+        telemetry.set_notify(move || {
+            assert!(
+                shared.try_lock().is_ok(),
+                "notification held the snapshot lock"
+            );
+            callback_count.fetch_add(1, Ordering::Relaxed);
+        });
+        telemetry.reset_baselines();
+        let reset = telemetry.shared.lock().unwrap().clone();
+        assert_eq!(reset.sequence, 21);
+        assert_eq!(telemetry.generation.load(Ordering::Acquire), 8);
+        for metric in [
+            &reset.cpu,
+            &reset.gpu,
+            &reset.disk,
+            &reset.npu,
+            &reset.disk_read_bytes_sec,
+            &reset.disk_write_bytes_sec,
+        ] {
+            assert_eq!(metric.state, MetricState::WarmingUp);
+            assert_eq!(metric.value, None);
+        }
+        assert_eq!(reset.ram.value, Some(40.0));
+        assert_eq!(reset.fan.state, MetricState::Unsupported);
+        assert_eq!(notified.load(Ordering::Relaxed), 1);
+        assert!(!commit_generation(
+            &telemetry.shared,
+            &telemetry.generation,
+            7,
+            |_| {
+                panic!("a pre-reset worker must not publish");
+            }
+        ));
+        assert_eq!(telemetry.shared.lock().unwrap().sequence, 21);
+        assert!(commit_generation(
+            &telemetry.shared,
+            &telemetry.generation,
+            8,
+            |snapshot| {
+                snapshot.cpu = Metric::reading(0.0, "test", FAST_INTERVAL, "fresh baseline");
+            }
+        ));
+        let fresh = telemetry.shared.lock().unwrap();
+        assert_eq!(fresh.sequence, 22);
+        assert_eq!(fresh.cpu.state, MetricState::Ready);
+        assert_eq!(fresh.cpu.value, Some(0.0));
+    }
+
+    #[test]
     fn stale_value_is_retained_but_its_state_is_not_ready() {
         let mut metric = Metric::reading(0.0, "test", FAST_INTERVAL, "");
+        let sampled_at = metric.sampled_at;
+        metric.expire(sampled_at + Duration::from_secs(2), Duration::from_secs(2));
+        assert_eq!(metric.state, MetricState::Ready);
         metric.expire(
-            metric.sampled_at + Duration::from_secs(3),
+            sampled_at + Duration::from_secs(2) + Duration::from_nanos(1),
             Duration::from_secs(2),
         );
         assert_eq!(metric.state, MetricState::Stale);
         assert_eq!(metric.value, Some(0.0));
-        let mut absent = Metric::unavailable(MetricState::NotPresent, "test", "");
-        absent.expire(
-            absent.sampled_at + Duration::from_secs(60),
+        assert_eq!(metric.sampled_at, sampled_at);
+        assert_eq!(metric.window, FAST_INTERVAL);
+        for state in [
+            MetricState::NotPresent,
+            MetricState::Unsupported,
+            MetricState::Error,
+        ] {
+            let mut absent = Metric::unavailable(state, "test", "");
+            absent.expire(
+                absent.sampled_at + Duration::from_secs(60),
+                Duration::from_secs(2),
+            );
+            assert_eq!(absent.state, state);
+            assert_eq!(absent.value, None);
+        }
+        let mut future = Metric::reading(12.0, "test", FAST_INTERVAL, "");
+        future.sampled_at = sampled_at + Duration::from_secs(10);
+        future.expire(sampled_at, Duration::from_secs(2));
+        assert_eq!(future.state, MetricState::Ready);
+        let mut warming = Metric::unavailable(MetricState::WarmingUp, "test", "");
+        warming.expire(
+            warming.sampled_at + Duration::from_secs(3),
             Duration::from_secs(2),
         );
-        assert_eq!(absent.state, MetricState::NotPresent);
-        assert_eq!(absent.value, None);
+        assert_eq!(warming.state, MetricState::Stale);
+        assert_eq!(warming.value, None);
     }
 }

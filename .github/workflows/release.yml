@@ -1,0 +1,110 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish after all gates (false builds a candidate only)
+        type: boolean
+        default: false
+      windows11_verified:
+        description: Completed docs/compatibility.md checks for this candidate in a clean Windows 11 VM
+        type: boolean
+        default: false
+      verified_candidate_run_id:
+        description: Successful Release candidate run ID tested on Windows 11 (required to publish)
+        type: string
+        default: ''
+      verified_executable_sha256:
+        description: SHA-256 of the candidate executable tested on Windows 11 (required to publish)
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-main
+  cancel-in-progress: false
+
+jobs:
+  ci:
+    if: github.ref == 'refs/heads/main'
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+  security:
+    if: github.ref == 'refs/heads/main'
+    uses: ./.github/workflows/security.yml
+    permissions:
+      contents: read
+      security-events: write
+  publish:
+    name: Publish verified release
+    needs: [ci, security]
+    if: github.ref == 'refs/heads/main' && inputs.publish
+    runs-on: windows-2025
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      security-events: read
+      actions: read
+    env:
+      VERIFIED_CANDIDATE_RUN_ID: ${{ inputs.verified_candidate_run_id }}
+      VERIFIED_EXECUTABLE_SHA256: ${{ inputs.verified_executable_sha256 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Verify candidate origin before download
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python scripts/release-gate.py --verify-origin
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: candidate-${{ github.sha }}
+          path: dist
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.verified_candidate_run_id }}
+          github-token: ${{ github.token }}
+      - name: Verify source, analysis and compatibility acknowledgement
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WINDOWS11_VERIFIED: ${{ inputs.windows11_verified }}
+        run: |
+          if ($env:WINDOWS11_VERIFIED -ne 'true') { throw 'Windows 11 compatibility verification is required before publication.' }
+          python scripts/release-gate.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          foreach ($line in Get-Content dist/SHA256SUMS.txt) {
+            if ($line -notmatch '^([A-Fa-f0-9]{64})  ([A-Za-z0-9._-]+)$') { throw 'Malformed checksum manifest' }
+            if ((Get-FileHash (Join-Path dist $Matches[2])).Hash -ne $Matches[1]) { throw 'Downloaded candidate checksum mismatch' }
+          }
+      - name: Create release without replacing an existing tag
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $version=(Get-Content dist/build-info.json -Raw | ConvertFrom-Json).version
+          $tag="v$version"
+          $assets=@(
+            "dist/TaskbarMonitor-Setup-$version-x64.exe",
+            "dist/TaskbarMonitor-Portable-$version-x64.zip",
+            'dist/SHA256SUMS.txt',
+            'dist/build-info.json'
+          )
+          foreach ($asset in $assets) {
+            if (-not (Test-Path -LiteralPath $asset -PathType Leaf)) { throw "Missing release asset: $asset" }
+          }
+          # Atomic creation rejects any tag added after preflight, without replacing it.
+          gh api --method POST "repos/$env:GITHUB_REPOSITORY/git/refs" -f "ref=refs/tags/$tag" -f "sha=$env:GITHUB_SHA" --silent
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          gh release create $tag --verify-tag --title "Taskbar Monitor $tag" --draft --notes-file docs/release-notes.md @assets
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/release-gate.py --verify-tag
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          gh release edit $tag --draft=false
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
