@@ -1,0 +1,16 @@
+/target/
+/dist/
+/payload/
+/validation/
+/diagnostics/
+/widget.json
+/portable.flag
+/startup-error.txt
+/probe-report.json
+*.log
+*.tmp
+*.pdb
+.env
+.env.*
+.vs/
+.idea/

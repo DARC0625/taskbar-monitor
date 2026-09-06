@@ -1,0 +1,356 @@
+Taskbar Monitor 0.4 - Third-Party Notices
+
+This distribution includes or was built using third-party software. Copyright
+and license notices are retained verbatim in the licenses directory. License
+expressions below are reproduced from each package's Cargo.toml metadata; the
+full texts and any additional notices are in that package's listed directory.
+
+The inventory covers all 53 external packages in the application's Cargo.lock,
+including procedural macros, build dependencies, and target-conditional packages.
+Inclusion here does not mean every listed package is linked into this x64 binary.
+Local registry license files were copied without modification. For 15 packages
+not present in the local registry source, published crates.io archives were
+checked against their Cargo.lock SHA-256 before extracting the license texts.
+
+Rust standard library / GNU runtime
+  The existing Rust runtime copyright inventory, GCC license, and GCC Runtime
+  Library Exception are retained under licenses/rust-gnu-runtime/:
+  COPYRIGHT-library.html, COPYING3, COPYING.RUNTIME.
+  https://www.rust-lang.org/policies/licenses
+  https://gcc.gnu.org/onlinedocs/libstdc++/manual/license.html
+
+LLVM / MinGW-w64 build-tool notices
+  The compiler build environment's LLVM and MinGW-w64 notices are included under
+  licenses/llvm-mingw-notices/. These supplement the Rust GNU runtime inventory.
+  Compiler/toolchain installations themselves are not part of this distribution.
+  https://llvm.org/
+  https://www.mingw-w64.org/
+
+Installer
+  The installer is built with Inno Setup by Jordan Russell and Martijn Laan.
+  Its original license is included as licenses/inno-setup/license.txt.
+  https://jrsoftware.org/
+
+The application uses Windows-provided APIs and installed system fonts. Copies of
+Windows system libraries or font files are not included in the application payload.
+
+Cargo package inventory
+=======================
+
+cc 1.4.5
+  Declared license: MIT OR Apache-2.0
+  License files: licenses/cc-1.4.5/ [LICENSE-APACHE, LICENSE-MIT]
+  Package: https://crates.io/crates/cc/1.4.5
+  Repository: https://github.com/rust-lang/cc-rs
+
+cfg-if 1.0.4
+  Declared license: MIT OR Apache-2.0
+  License files: licenses/cfg-if-1.0.4/ [LICENSE-APACHE, LICENSE-MIT]
+  Package: https://crates.io/crates/cfg-if/1.0.4
+  Repository: https://github.com/rust-lang/cfg-if
+
+embed-resource 3.0.11
+  Declared license: MIT
+  License files: licenses/embed-resource-3.0.11/ [LICENSE]
+  Package: https://crates.io/crates/embed-resource/3.0.11
+  Repository: https://github.com/nabijaczleweli/rust-embed-resource
+
+equivalent 1.0.2
+  Declared license: Apache-2.0 OR MIT
+  License files: licenses/equivalent-1.0.2/ [LICENSE-APACHE, LICENSE-MIT]
+  Package: https://crates.io/crates/equivalent/1.0.2
+  Repository: https://github.com/indexmap-rs/equivalent
+
+find-msvc-tools 0.1.12
+  Declared license: MIT OR Apache-2.0
+  License files: licenses/find-msvc-tools-0.1.12/ [LICENSE-APACHE, LICENSE-MIT]
+  Package: https://crates.io/crates/find-msvc-tools/0.1.12
+  Repository: https://github.com/rust-lang/cc-rs
+
+hashbrown 0.17.1
+  Declared license: MIT OR Apache-2.0
+  License files: licenses/hashbrown-0.17.1/ [LICENSE-APACHE, LICENSE-MIT]
+  Package: https://crates.io/crates/hashbrown/0.17.1
+  Repository: https://github.com/rust-lang/hashbrown
+
+indexmap 2.14.2
+  Declared license: Apache-2.0 OR MIT
+  License files: licenses/indexmap-2.14.2/ [LICENSE-APACHE, LICENSE-MIT]
+  Package: https://crates.io/crates/indexmap/2.14.2
+  Repository: https://github.com/indexmap-rs/indexmap
+
+itoa 1.0.18
+  Declared license: MIT OR Apache-2.0
+  License files: licenses/itoa-1.0.18/ [LICENSE-APACHE, LICENSE-MIT]
+  Package: https://crates.io/crates/itoa/1.0.18
+  Repository: https://github.com/dtolnay/itoa
+
+libc 0.2.189
+  Declared license: MIT OR Apache-2.0
+  License files: licenses/libc-0.2.189/ [LICENSE-APACHE, LICENSE-MIT]
+  Package: https://crates.io/crates/libc/0.2.189
+  Repository: https://github.com/rust-lang/libc
+
+memchr 2.8.3
+  Declared license: Unlicense OR MIT
+  License files: licenses/memchr-2.8.3/ [COPYING, LICENSE-MIT, UNLICENSE]
+  Package: https://crates.io/crates/memchr/2.8.3
+  Repository: https://github.com/BurntSushi/memchr
+
+proc-macro2 1.0.107
+  Declared license: MIT OR Apache-2.0
+  License files: licenses/proc-macro2-1.0.107/ [LICENSE-APACHE, LICENSE-MIT]
+  Package: https://crates.io/crates/proc-macro2/1.0.107
+  Repository: https://github.com/dtolnay/proc-macro2
+
+quote 1.0.47
+  Declared license: MIT OR Apache-2.0
+  License files: licenses/quote-1.0.47/ [LICENSE-APACHE, LICENSE-MIT]
+  Package: https://crates.io/crates/quote/1.0.47
+  Repository: https://github.com/dtolnay/quote
+
+rustc_version 0.4.1
+  Declared license: MIT OR Apache-2.0
+  License files: licenses/rustc_version-0.4.1/ [LICENSE-APACHE, LICENSE-MIT]
+  Package: https://crates.io/crates/rustc_version/0.4.1
+  Repository: https://github.com/djc/rustc-version-rs
+
+semver 1.0.28
+  Declared license: MIT OR Apache-2.0
+  License files: licenses/semver-1.0.28/ [LICENSE-APACHE, LICENSE-MIT]
+  Package: https://crates.io/crates/semver/1.0.28
+  Repository: https://github.com/dtolnay/semver
+
+serde 1.0.229
+  Declared license: MIT OR Apache-2.0
+  License files: licenses/serde-1.0.229/ [LICENSE-APACHE, LICENSE-MIT]
+  Package: https://crates.io/crates/serde/1.0.229
+  Repository: https://github.com/serde-rs/serde
+
+serde_core 1.0.229
+  Declared license: MIT OR Apache-2.0
+  License files: licenses/serde_core-1.0.229/ [LICENSE-APACHE, LICENSE-MIT]
+  Package: https://crates.io/crates/serde_core/1.0.229
+  Repository: https://github.com/serde-rs/serde
+
+serde_derive 1.0.229
+  Declared license: MIT OR Apache-2.0
+  License files: licenses/serde_derive-1.0.229/ [LICENSE-APACHE, LICENSE-MIT]
+  Package: https://crates.io/crates/serde_derive/1.0.229
+  Repository: https://github.com/serde-rs/serde
+
+serde_json 1.0.151
+  Declared license: MIT OR Apache-2.0
+  License files: licenses/serde_json-1.0.151/ [LICENSE-APACHE, LICENSE-MIT]
+  Package: https://crates.io/crates/serde_json/1.0.151
+  Repository: https://github.com/serde-rs/json
+
+serde_spanned 1.1.1
+  Declared license: MIT OR Apache-2.0
+  License files: licenses/serde_spanned-1.1.1/ [LICENSE-APACHE, LICENSE-MIT]
+  Package: https://crates.io/crates/serde_spanned/1.1.1
+  Repository: https://github.com/toml-rs/toml
+
+shlex 2.0.1
+  Declared license: MIT OR Apache-2.0
+  License files: licenses/shlex-2.0.1/ [LICENSE-APACHE, LICENSE-MIT]
+  Package: https://crates.io/crates/shlex/2.0.1
+  Repository: https://github.com/comex/rust-shlex
+
+syn 2.0.119
+  Declared license: MIT OR Apache-2.0
+  License files: licenses/syn-2.0.119/ [LICENSE-APACHE, LICENSE-MIT]
+  Package: https://crates.io/crates/syn/2.0.119
+  Repository: https://github.com/dtolnay/syn
+
+syn 3.0.5
+  Declared license: MIT OR Apache-2.0
+  License files: licenses/syn-3.0.5/ [LICENSE-APACHE, LICENSE-MIT]
+  Package: https://crates.io/crates/syn/3.0.5
+  Repository: https://github.com/dtolnay/syn
+
+toml 1.1.5+spec-1.1.0
+  Declared license: MIT OR Apache-2.0
+  License files: licenses/toml-1.1.5+spec-1.1.0/ [LICENSE-APACHE, LICENSE-MIT]
+  Package: https://crates.io/crates/toml/1.1.5+spec-1.1.0
+  Repository: https://github.com/toml-rs/toml
+
+toml_datetime 1.1.1+spec-1.1.0
+  Declared license: MIT OR Apache-2.0
+  License files: licenses/toml_datetime-1.1.1+spec-1.1.0/ [LICENSE-APACHE, LICENSE-MIT]
+  Package: https://crates.io/crates/toml_datetime/1.1.1+spec-1.1.0
+  Repository: https://github.com/toml-rs/toml
+
+toml_parser 1.1.3+spec-1.1.0
+  Declared license: MIT OR Apache-2.0
+  License files: licenses/toml_parser-1.1.3+spec-1.1.0/ [LICENSE-APACHE, LICENSE-MIT]
+  Package: https://crates.io/crates/toml_parser/1.1.3+spec-1.1.0
+  Repository: https://github.com/toml-rs/toml
+
+toml_writer 1.1.2+spec-1.1.0
+  Declared license: MIT OR Apache-2.0
+  License files: licenses/toml_writer-1.1.2+spec-1.1.0/ [LICENSE-APACHE, LICENSE-MIT]
+  Package: https://crates.io/crates/toml_writer/1.1.2+spec-1.1.0
+  Repository: https://github.com/toml-rs/toml
+
+unicode-ident 1.0.24
+  Declared license: (MIT OR Apache-2.0) AND Unicode-3.0
+  License files: licenses/unicode-ident-1.0.24/ [LICENSE-APACHE, LICENSE-MIT, LICENSE-UNICODE]
+  Package: https://crates.io/crates/unicode-ident/1.0.24
+  Repository: https://github.com/dtolnay/unicode-ident
+
+vswhom 0.1.0
+  Declared license: MIT
+  License files: licenses/vswhom-0.1.0/ [LICENSE]
+  Package: https://crates.io/crates/vswhom/0.1.0
+  Repository: https://github.com/nabijaczleweli/vswhom.rs
+
+vswhom-sys 0.1.3
+  Declared license: MIT
+  License files: licenses/vswhom-sys-0.1.3/ [LICENSE]
+  Package: https://crates.io/crates/vswhom-sys/0.1.3
+  Repository: https://github.com/nabijaczleweli/vswhom-sys.rs
+
+windows 0.62.2
+  Declared license: MIT OR Apache-2.0
+  License files: licenses/windows-0.62.2/ [license-apache-2.0, license-mit]
+  Package: https://crates.io/crates/windows/0.62.2
+  Repository: https://github.com/microsoft/windows-rs
+
+windows_aarch64_gnullvm 0.52.6
+  Declared license: MIT OR Apache-2.0
+  License files: licenses/windows_aarch64_gnullvm-0.52.6/ [license-apache-2.0, license-mit]
+  Package: https://crates.io/crates/windows_aarch64_gnullvm/0.52.6
+  Repository: https://github.com/microsoft/windows-rs
+
+windows_aarch64_msvc 0.52.6
+  Declared license: MIT OR Apache-2.0
+  License files: licenses/windows_aarch64_msvc-0.52.6/ [license-apache-2.0, license-mit]
+  Package: https://crates.io/crates/windows_aarch64_msvc/0.52.6
+  Repository: https://github.com/microsoft/windows-rs
+
+windows_i686_gnu 0.52.6
+  Declared license: MIT OR Apache-2.0
+  License files: licenses/windows_i686_gnu-0.52.6/ [license-apache-2.0, license-mit]
+  Package: https://crates.io/crates/windows_i686_gnu/0.52.6
+  Repository: https://github.com/microsoft/windows-rs
+
+windows_i686_gnullvm 0.52.6
+  Declared license: MIT OR Apache-2.0
+  License files: licenses/windows_i686_gnullvm-0.52.6/ [license-apache-2.0, license-mit]
+  Package: https://crates.io/crates/windows_i686_gnullvm/0.52.6
+  Repository: https://github.com/microsoft/windows-rs
+
+windows_i686_msvc 0.52.6
+  Declared license: MIT OR Apache-2.0
+  License files: licenses/windows_i686_msvc-0.52.6/ [license-apache-2.0, license-mit]
+  Package: https://crates.io/crates/windows_i686_msvc/0.52.6
+  Repository: https://github.com/microsoft/windows-rs
+
+windows_x86_64_gnu 0.52.6
+  Declared license: MIT OR Apache-2.0
+  License files: licenses/windows_x86_64_gnu-0.52.6/ [license-apache-2.0, license-mit]
+  Package: https://crates.io/crates/windows_x86_64_gnu/0.52.6
+  Repository: https://github.com/microsoft/windows-rs
+
+windows_x86_64_gnullvm 0.52.6
+  Declared license: MIT OR Apache-2.0
+  License files: licenses/windows_x86_64_gnullvm-0.52.6/ [license-apache-2.0, license-mit]
+  Package: https://crates.io/crates/windows_x86_64_gnullvm/0.52.6
+  Repository: https://github.com/microsoft/windows-rs
+
+windows_x86_64_msvc 0.52.6
+  Declared license: MIT OR Apache-2.0
+  License files: licenses/windows_x86_64_msvc-0.52.6/ [license-apache-2.0, license-mit]
+  Package: https://crates.io/crates/windows_x86_64_msvc/0.52.6
+  Repository: https://github.com/microsoft/windows-rs
+
+windows-collections 0.3.2
+  Declared license: MIT OR Apache-2.0
+  License files: licenses/windows-collections-0.3.2/ [license-apache-2.0, license-mit]
+  Package: https://crates.io/crates/windows-collections/0.3.2
+  Repository: https://github.com/microsoft/windows-rs
+
+windows-core 0.62.2
+  Declared license: MIT OR Apache-2.0
+  License files: licenses/windows-core-0.62.2/ [license-apache-2.0, license-mit]
+  Package: https://crates.io/crates/windows-core/0.62.2
+  Repository: https://github.com/microsoft/windows-rs
+
+windows-future 0.3.2
+  Declared license: MIT OR Apache-2.0
+  License files: licenses/windows-future-0.3.2/ [license-apache-2.0, license-mit]
+  Package: https://crates.io/crates/windows-future/0.3.2
+  Repository: https://github.com/microsoft/windows-rs
+
+windows-implement 0.60.2
+  Declared license: MIT OR Apache-2.0
+  License files: licenses/windows-implement-0.60.2/ [license-apache-2.0, license-mit]
+  Package: https://crates.io/crates/windows-implement/0.60.2
+  Repository: https://github.com/microsoft/windows-rs
+
+windows-interface 0.59.3
+  Declared license: MIT OR Apache-2.0
+  License files: licenses/windows-interface-0.59.3/ [license-apache-2.0, license-mit]
+  Package: https://crates.io/crates/windows-interface/0.59.3
+  Repository: https://github.com/microsoft/windows-rs
+
+windows-link 0.2.1
+  Declared license: MIT OR Apache-2.0
+  License files: licenses/windows-link-0.2.1/ [license-apache-2.0, license-mit]
+  Package: https://crates.io/crates/windows-link/0.2.1
+  Repository: https://github.com/microsoft/windows-rs
+
+windows-numerics 0.3.1
+  Declared license: MIT OR Apache-2.0
+  License files: licenses/windows-numerics-0.3.1/ [license-apache-2.0, license-mit]
+  Package: https://crates.io/crates/windows-numerics/0.3.1
+  Repository: https://github.com/microsoft/windows-rs
+
+windows-result 0.4.1
+  Declared license: MIT OR Apache-2.0
+  License files: licenses/windows-result-0.4.1/ [license-apache-2.0, license-mit]
+  Package: https://crates.io/crates/windows-result/0.4.1
+  Repository: https://github.com/microsoft/windows-rs
+
+windows-strings 0.5.1
+  Declared license: MIT OR Apache-2.0
+  License files: licenses/windows-strings-0.5.1/ [license-apache-2.0, license-mit]
+  Package: https://crates.io/crates/windows-strings/0.5.1
+  Repository: https://github.com/microsoft/windows-rs
+
+windows-sys 0.59.0
+  Declared license: MIT OR Apache-2.0
+  License files: licenses/windows-sys-0.59.0/ [license-apache-2.0, license-mit]
+  Package: https://crates.io/crates/windows-sys/0.59.0
+  Repository: https://github.com/microsoft/windows-rs
+
+windows-targets 0.52.6
+  Declared license: MIT OR Apache-2.0
+  License files: licenses/windows-targets-0.52.6/ [license-apache-2.0, license-mit]
+  Package: https://crates.io/crates/windows-targets/0.52.6
+  Repository: https://github.com/microsoft/windows-rs
+
+windows-threading 0.2.1
+  Declared license: MIT OR Apache-2.0
+  License files: licenses/windows-threading-0.2.1/ [license-apache-2.0, license-mit]
+  Package: https://crates.io/crates/windows-threading/0.2.1
+  Repository: https://github.com/microsoft/windows-rs
+
+winnow 1.0.4
+  Declared license: MIT
+  License files: licenses/winnow-1.0.4/ [LICENSE-MIT]
+  Package: https://crates.io/crates/winnow/1.0.4
+  Repository: https://github.com/winnow-rs/winnow
+
+winreg 0.55.0
+  Declared license: MIT
+  License files: licenses/winreg-0.55.0/ [LICENSE]
+  Package: https://crates.io/crates/winreg/0.55.0
+  Repository: https://github.com/gentoo90/winreg-rs
+
+zmij 1.0.23
+  Declared license: MIT
+  License files: licenses/zmij-1.0.23/ [LICENSE-MIT]
+  Package: https://crates.io/crates/zmij/1.0.23
+  Repository: https://github.com/dtolnay/zmij

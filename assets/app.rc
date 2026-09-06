@@ -1,0 +1,31 @@
+#include <windows.h>
+#define STRINGIFY_DETAIL(x) #x
+#define STRINGIFY(x) STRINGIFY_DETAIL(x)
+#define APP_VERSION_STRING STRINGIFY(APP_VERSION_TEXT)
+101 ICON "taskbar-monitor.ico"
+1 RT_MANIFEST "app.manifest"
+1 VERSIONINFO
+FILEVERSION APP_VERSION
+PRODUCTVERSION APP_VERSION
+FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
+FILEFLAGS 0
+FILEOS VOS_NT_WINDOWS32
+FILETYPE VFT_APP
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "040904B0"
+    BEGIN
+      VALUE "FileDescription", "Taskbar Monitor"
+      VALUE "FileVersion", APP_VERSION_STRING
+      VALUE "InternalName", "taskbar-monitor"
+      VALUE "OriginalFilename", "taskbar-monitor.exe"
+      VALUE "ProductName", "Taskbar Monitor"
+      VALUE "ProductVersion", APP_VERSION_STRING
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x0409, 1200
+  END
+END
