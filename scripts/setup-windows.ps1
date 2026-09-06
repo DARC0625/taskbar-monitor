@@ -13,9 +13,12 @@ function Get-VerifiedFile([string]$Url,[string]$Name,[string]$Sha256) {
     if((Get-FileHash -LiteralPath $file).Hash -ne $Sha256){throw "Tool checksum mismatch: $Name"}
     return $file
 }
-rustup toolchain install 1.98.1 --profile minimal --component rustfmt --component clippy --target $Target
+# Use a matching host toolchain. Adding only the GNU target to an MSVC host
+# omits the bundled MinGW import/exception libraries required by self-contained LLD.
+$rustToolchain="1.98.1-$Target"
+rustup toolchain install $rustToolchain --profile minimal --component rustfmt --component clippy
 if($LASTEXITCODE -ne 0){throw 'Rust toolchain installation failed'}
-rustup override set 1.98.1 --path $root
+rustup override set $rustToolchain --path $root
 if($LASTEXITCODE -ne 0){throw 'Rust override failed'}
 $env:CARGO_BUILD_TARGET=$Target
 $flags=@()
@@ -24,8 +27,8 @@ if($Target -eq 'x86_64-pc-windows-gnu') {
     $bin=Join-Path $toolsPath 'llvm-mingw-20260826-ucrt-x86_64/bin'
     if(-not (Test-Path -LiteralPath (Join-Path $bin 'llvm-rc.exe'))){Expand-Archive -LiteralPath $archive -DestinationPath $toolsPath}
     $env:PATH="$bin;$env:PATH"
-    $sysroot=(& rustup run 1.98.1 rustc --print sysroot).Trim()
-    $hostTriple=((& rustup run 1.98.1 rustc -vV | Select-String '^host:').ToString() -split ':',2)[1].Trim()
+    $sysroot=(& rustup run $rustToolchain rustc --print sysroot).Trim()
+    $hostTriple=((& rustup run $rustToolchain rustc -vV | Select-String '^host:').ToString() -split ':',2)[1].Trim()
     $linker=Join-Path $sysroot "lib/rustlib/$hostTriple/bin/rust-lld.exe"
     if(-not (Test-Path -LiteralPath $linker)){throw 'Rust LLD is unavailable'}
     $env:CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=$linker
