@@ -10,7 +10,7 @@ GNU 빌드는 LLVM-MinGW의 bin을 PATH 앞에 두어 windres/dlltool을 사용�
 
 1. `cargo fmt --check`, `cargo test --locked`, `cargo build --release --locked`를 실행합니다.
 2. build.rs가 assets/app.rc의 아이콘·버전 정보·manifest를 EXE에 넣습니다. 아이콘 재생성만 Python/Pillow와 packaging/make-icon.py를 사용합니다.
-3. payload 폴더에 taskbar-monitor.exe, README.ko.txt, THIRD-PARTY-NOTICES.txt, licenses/를 준비합니다. 배포 ZIP에 든 동일 버전의 고지/라이선스를 그대로 사용할 수 있습니다.
+3. payload 폴더에 taskbar-monitor.exe, packaging/README.ko.txt, 루트 LICENSE, THIRD-PARTY-NOTICES.txt, licenses/를 준비합니다. packaging/build-release.ps1은 빌드 후 이 파일들을 함께 복사합니다.
 4. `ISCC.exe /DPayloadDir="절대 payload 경로" /DReleaseDir="절대 출력 경로" packaging/installer.iss`로 설치 프로그램을 만듭니다. 한국어 번역은 Inno Setup에 포함됩니다.
 5. 휴대용 ZIP에만 portable.flag를 넣습니다. 설치 payload에는 설정·portable.flag·검증 보고서·소스를 넣지 않습니다.
 

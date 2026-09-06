@@ -99,6 +99,7 @@ Name: "autostart"; Description: "{cm:AutostartTask}"; GroupDescription: "{cm:Add
 Source: "{#PayloadDir}\{#AppExeName}"; DestName: "{#QuitHelperName}"; Flags: dontcopy noencryption
 Source: "{#PayloadDir}\{#AppExeName}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#PayloadDir}\README.ko.txt"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#PayloadDir}\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#PayloadDir}\THIRD-PARTY-NOTICES.txt"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#PayloadDir}\licenses\*"; DestDir: "{app}\licenses"; Flags: ignoreversion recursesubdirs createallsubdirs
 
