@@ -73,13 +73,49 @@ function Assert-Number($Value, [string]$Name, [switch]$Integer) {
 function Assert-Boolean($Value, [bool]$Expected, [string]$Name) {
     Assert-That ($Value -is [bool] -and $Value -eq $Expected) "Unexpected boolean: $Name."
 }
+function Stop-IdentityCheck([string]$Kind, [string]$Message) {
+    # Fixed diagnostic codes/messages only; never disclose a queried image path.
+    [ordered]@{ schema_version = 1; passed = $false; status = 'failed'; failure_type = $Kind } |
+        ConvertTo-Json | Set-Content -LiteralPath $summaryPath -Encoding utf8
+    throw ($Kind + ': ' + $Message)
+}
 function Assert-OwnedRunning {
-    Assert-That ($null -ne $owned -and -not $owned.HasExited) 'The owned candidate exited before the requested action.'
-    $current = Get-Process -Id $ownedId -ErrorAction Stop
-    try {
-        Assert-That ($current.StartTime.ToUniversalTime().ToFileTimeUtc() -eq $ownedStart) 'Candidate PID was reused; refusing control.'
-        Assert-That ($current.Path -ieq $candidate) 'Candidate executable identity changed; refusing control.'
-    } finally { $current.Dispose() }
+    $pathWait = [Diagnostics.Stopwatch]::StartNew()
+    $pathState = 'image_path_unavailable'
+    while ($true) {
+        if ($null -eq $owned -or $owned.HasExited) {
+            Stop-IdentityCheck 'owned_process_exited' 'The owned candidate exited before the requested action.'
+        }
+        if ($owned.SafeHandle.IsClosed -or $owned.SafeHandle.IsInvalid) {
+            Stop-IdentityCheck 'owned_handle_unavailable' 'The retained owned-process handle is unavailable; refusing control.'
+        }
+        # Identity checks are never relaxed or retried. Only the image-path
+        # getter may be temporarily empty/fail while the process is loading.
+        try { $current = Get-Process -Id $ownedId -ErrorAction Stop }
+        catch { Stop-IdentityCheck 'process_identity_unavailable' 'The owned process could not be queried; refusing control.' }
+        try {
+            try { $currentStart = $current.StartTime.ToUniversalTime().ToFileTimeUtc() }
+            catch { Stop-IdentityCheck 'process_identity_unavailable' 'The process creation time could not be queried; refusing control.' }
+            if ($currentStart -ne $ownedStart) {
+                Stop-IdentityCheck 'process_identity_mismatch' 'Candidate PID was reused; refusing control.'
+            }
+            $imagePath = $null
+            try {
+                $imagePath = $current.Path
+                $pathState = 'image_path_unavailable'
+            } catch { $pathState = 'image_path_query_failed' }
+            if (-not [string]::IsNullOrWhiteSpace($imagePath)) {
+                if ($imagePath -ine $candidate) {
+                    Stop-IdentityCheck 'image_path_mismatch' 'Candidate executable identity differs; refusing control.'
+                }
+                return
+            }
+        } finally { $current.Dispose() }
+        if ($pathWait.Elapsed.TotalSeconds -ge 4 -or $clock.Elapsed.TotalSeconds -ge $deadlineSeconds) {
+            Stop-IdentityCheck $pathState 'Candidate image path remained unavailable within the bounded retry; refusing control.'
+        }
+        Start-Sleep -Milliseconds 100
+    }
 }
 function Assert-Exclusive([Diagnostics.Process]$Helper = $null) {
     foreach ($process in @(Get-Process -Name 'taskbar-monitor' -ErrorAction SilentlyContinue)) {
