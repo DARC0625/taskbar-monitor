@@ -82,6 +82,29 @@ pub struct RendererStats {
     pub tick_sets_reused: u64,
 }
 
+impl RendererStats {
+    /// Preserve counters across replacement renderers without retaining COM resources.
+    pub fn accumulate(&mut self, other: Self) {
+        self.frames_presented = self.frames_presented.saturating_add(other.frames_presented);
+        self.text_layouts_created = self
+            .text_layouts_created
+            .saturating_add(other.text_layouts_created);
+        self.text_layouts_reused = self
+            .text_layouts_reused
+            .saturating_add(other.text_layouts_reused);
+        self.path_geometries_created = self
+            .path_geometries_created
+            .saturating_add(other.path_geometries_created);
+        self.path_geometries_reused = self
+            .path_geometries_reused
+            .saturating_add(other.path_geometries_reused);
+        self.tick_sets_created = self
+            .tick_sets_created
+            .saturating_add(other.tick_sets_created);
+        self.tick_sets_reused = self.tick_sets_reused.saturating_add(other.tick_sets_reused);
+    }
+}
+
 pub struct Renderer {
     hwnd: HWND,
     cache: Vec<CachedCell>,
@@ -646,6 +669,37 @@ impl Palette {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replacement_renderer_statistics_accumulate_without_wrapping() {
+        let mut total = RendererStats {
+            frames_presented: u64::MAX - 1,
+            ..Default::default()
+        };
+        total.accumulate(RendererStats {
+            frames_presented: 2,
+            text_layouts_created: 5,
+            path_geometries_created: 2,
+            tick_sets_created: 1,
+            ..Default::default()
+        });
+        total.accumulate(RendererStats {
+            frames_presented: 3,
+            text_layouts_created: 5,
+            path_geometries_created: 2,
+            tick_sets_created: 1,
+            ..Default::default()
+        });
+        assert_eq!(total.frames_presented, u64::MAX);
+        assert_eq!(
+            (
+                total.text_layouts_created,
+                total.path_geometries_created,
+                total.tick_sets_created
+            ),
+            (10, 4, 2)
+        );
+    }
 
     fn sample(progress: Option<f32>, muted: bool) -> Cell {
         Cell {

@@ -14,6 +14,8 @@ mod native;
 pub const FAST_INTERVAL: Duration = Duration::from_millis(250);
 pub const SLOW_INTERVAL: Duration = Duration::from_secs(1);
 const RESUME_GAP: Duration = Duration::from_secs(3);
+const RETRY_INTERVAL: Duration = Duration::from_secs(30);
+const SHUTDOWN_BUDGET: Duration = Duration::from_millis(250);
 type Notification = Arc<Mutex<Option<Arc<dyn Fn() + Send + Sync>>>>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -139,7 +141,8 @@ impl Default for Snapshot {
     }
 }
 
-/// Owns two bounded workers. There is no telemetry network traffic or process inventory.
+/// Owns four fixed workers: CPU/RAM, GPU, disk and NPU. Slow native calls never
+/// cause replacement threads to be spawned. There is no telemetry network traffic.
 pub struct Telemetry {
     shared: Arc<Mutex<Snapshot>>,
     stop: Arc<AtomicBool>,
@@ -150,74 +153,145 @@ pub struct Telemetry {
 
 impl Telemetry {
     pub fn start() -> Self {
-        let shared = Arc::new(Mutex::new(Snapshot::default()));
-        let stop = Arc::new(AtomicBool::new(false));
-        let generation = Arc::new(AtomicU64::new(0));
-        let notify: Notification = Arc::new(Mutex::new(None));
-        let mut workers = Vec::new();
-
+        let mut telemetry = Self::without_workers();
         #[cfg(windows)]
         {
-            let state = shared.clone();
-            let stopping = stop.clone();
-            let version = generation.clone();
-            let notification = notify.clone();
-            match thread::Builder::new()
-                .name("telemetry-fast".into())
-                .spawn(move || {
-                    fast_worker(state, stopping, version, notification);
-                }) {
-                Ok(worker) => workers.push(worker),
-                Err(error) => with_snapshot(&shared, |snapshot| {
+            if let Err(error) = telemetry.spawn_worker("telemetry-fast", fast_worker) {
+                with_snapshot(&telemetry.shared, |snapshot| {
                     snapshot.cpu =
                         Metric::unavailable(MetricState::Error, "Worker", error.to_string());
                     snapshot.ram = snapshot.cpu.clone();
-                }),
+                });
             }
-            let state = shared.clone();
-            let stopping = stop.clone();
-            let version = generation.clone();
-            let notification = notify.clone();
-            match thread::Builder::new()
-                .name("telemetry-devices".into())
-                .spawn(move || {
-                    slow_worker(state, stopping, version, notification);
-                }) {
-                Ok(worker) => workers.push(worker),
-                Err(error) => with_snapshot(&shared, |snapshot| {
+            if let Err(error) = telemetry.spawn_worker("telemetry-gpu", |context| {
+                collector_worker(
+                    context,
+                    SLOW_INTERVAL,
+                    native::GpuProvider::new,
+                    |snapshot, sample| {
+                        snapshot.gpu = sample.gpu;
+                        snapshot.gpu_adapter = sample.adapter;
+                    },
+                );
+            }) {
+                with_snapshot(&telemetry.shared, |snapshot| {
                     snapshot.gpu =
                         Metric::unavailable(MetricState::Error, "Worker", error.to_string());
-                    snapshot.disk = snapshot.gpu.clone();
-                    snapshot.npu = snapshot.gpu.clone();
-                    snapshot.disk_read_bytes_sec = snapshot.gpu.clone();
-                    snapshot.disk_write_bytes_sec = snapshot.gpu.clone();
-                }),
+                });
+            }
+            if let Err(error) = telemetry.spawn_worker("telemetry-disk", |context| {
+                collector_worker(
+                    context,
+                    SLOW_INTERVAL,
+                    native::DiskProvider::new,
+                    |snapshot, sample| {
+                        snapshot.disk = sample.disk;
+                        snapshot.disk_read_bytes_sec = sample.read;
+                        snapshot.disk_write_bytes_sec = sample.write;
+                    },
+                );
+            }) {
+                with_snapshot(&telemetry.shared, |snapshot| {
+                    snapshot.disk =
+                        Metric::unavailable(MetricState::Error, "Worker", error.to_string());
+                    snapshot.disk_read_bytes_sec = snapshot.disk.clone();
+                    snapshot.disk_write_bytes_sec = snapshot.disk.clone();
+                });
+            }
+            if let Err(error) = telemetry.spawn_worker("telemetry-npu", |context| {
+                collector_worker(
+                    context,
+                    SLOW_INTERVAL,
+                    native::NpuProvider::new,
+                    |snapshot, sample| {
+                        snapshot.npu = sample;
+                    },
+                );
+            }) {
+                with_snapshot(&telemetry.shared, |snapshot| {
+                    snapshot.npu =
+                        Metric::unavailable(MetricState::Error, "Worker", error.to_string());
+                });
             }
         }
-
         #[cfg(not(windows))]
-        with_snapshot(&shared, |snapshot| {
+        with_snapshot(&telemetry.shared, |snapshot| {
             let missing =
                 Metric::unavailable(MetricState::Unsupported, "Platform", "Windows 11 전용");
             snapshot.cpu = missing.clone();
             snapshot.ram = missing.clone();
             snapshot.gpu = missing.clone();
             snapshot.disk = missing.clone();
+            snapshot.disk_read_bytes_sec = missing.clone();
+            snapshot.disk_write_bytes_sec = missing.clone();
             snapshot.npu = missing;
         });
+        telemetry
+    }
 
+    fn without_workers() -> Self {
         Self {
-            shared,
-            stop,
-            generation,
-            notify,
-            workers,
+            shared: Arc::new(Mutex::new(Snapshot::default())),
+            stop: Arc::new(AtomicBool::new(false)),
+            generation: Arc::new(AtomicU64::new(0)),
+            notify: Arc::new(Mutex::new(None)),
+            workers: Vec::with_capacity(4),
         }
     }
 
-    /// The callback runs on collector threads outside the snapshot lock; post a UI message.
+    fn spawn_worker(
+        &mut self,
+        name: &str,
+        run: impl FnOnce(WorkerContext) + Send + 'static,
+    ) -> std::io::Result<()> {
+        // Fixed at startup. A slow provider is never replaced by another thread.
+        if self.workers.len() >= 4 {
+            return Err(std::io::Error::other("telemetry worker limit reached"));
+        }
+        let context = WorkerContext {
+            shared: self.shared.clone(),
+            stop: self.stop.clone(),
+            generation: self.generation.clone(),
+            notify: self.notify.clone(),
+        };
+        self.workers.push(
+            thread::Builder::new()
+                .name(name.into())
+                .spawn(move || run(context))?,
+        );
+        Ok(())
+    }
+
+    /// The callback runs outside the snapshot lock. It must only post a UI message,
+    /// remain nonblocking, and must not call set_notify or request_stop recursively. Invocation and
+    /// removal are serialized so shutdown cannot leave a copied HWND callback behind.
     pub fn set_notify(&self, callback: impl Fn() + Send + Sync + 'static) {
-        *self.notify.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(callback));
+        let mut notification = self.notify.lock().unwrap_or_else(|e| e.into_inner());
+        if !self.stop.load(Ordering::Acquire) {
+            *notification = Some(Arc::new(callback));
+        }
+    }
+
+    /// Disable publication and drain UI callbacks before their HWND is destroyed.
+    /// Repeated requests are harmless. Native workers are only signaled here;
+    /// Drop waits for them using one shared time budget.
+    pub fn request_stop(&self) {
+        // Holding this guard serializes simultaneous requests with callbacks and
+        // makes the first request's generation invalidation visible before any
+        // subsequent request returns. No native provider call holds these locks.
+        let mut notification = self.notify.lock().unwrap_or_else(|e| e.into_inner());
+        let already_stopped = self.stop.swap(true, Ordering::AcqRel);
+        *notification = None;
+        {
+            let _snapshot = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+            if !already_stopped {
+                self.generation.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+        drop(notification);
+        for worker in &self.workers {
+            worker.thread().unpark();
+        }
     }
 
     pub fn snapshot(&self) -> Snapshot {
@@ -241,10 +315,12 @@ impl Telemetry {
         snapshot
     }
 
-    /// Call on resume, device changes or explicit refresh. Neither worker is blocked here.
+    /// Call on resume, device changes or explicit refresh. No provider call is made here.
     pub fn reset_baselines(&self) {
-        self.generation.fetch_add(1, Ordering::Release);
         with_snapshot(&self.shared, |snapshot| {
+            // Generation and visible baselines change together: a new-generation
+            // result must not be overwritten by a reset that was waiting for this lock.
+            self.generation.fetch_add(1, Ordering::Release);
             for metric in [
                 &mut snapshot.cpu,
                 &mut snapshot.gpu,
@@ -260,7 +336,7 @@ impl Telemetry {
                 );
             }
         });
-        notify_changed(&self.notify);
+        notify_changed(&self.notify, &self.stop);
         for worker in &self.workers {
             worker.thread().unpark();
         }
@@ -275,13 +351,35 @@ impl Default for Telemetry {
 
 impl Drop for Telemetry {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
-        for worker in &self.workers {
-            worker.thread().unpark();
+        let deadline = Instant::now() + SHUTDOWN_BUDGET;
+        self.request_stop();
+        wait_until(&mut self.workers, deadline);
+    }
+}
+
+fn wait_until(workers: &mut Vec<JoinHandle<()>>, deadline: Instant) {
+    loop {
+        let mut index = 0;
+        while index < workers.len() {
+            if workers[index].is_finished() {
+                // Even after is_finished(), join can still wait for the native
+                // thread's final teardown. No borrowed state requires a join.
+                drop(workers.swap_remove(index));
+            } else {
+                index += 1;
+            }
         }
-        for worker in self.workers.drain(..) {
-            let _ = worker.join();
+        if workers.is_empty() {
+            return;
         }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            // Dropping JoinHandle detaches only. The stopped worker owns its Arc
+            // state and native handles until the call and its own cleanup return.
+            workers.clear();
+            return;
+        }
+        thread::sleep(remaining.min(Duration::from_millis(2)));
     }
 }
 
@@ -295,11 +393,12 @@ fn with_snapshot(shared: &Mutex<Snapshot>, update: impl FnOnce(&mut Snapshot)) {
 fn commit_generation(
     shared: &Mutex<Snapshot>,
     generation: &AtomicU64,
+    stop: &AtomicBool,
     expected_generation: u64,
     update: impl FnOnce(&mut Snapshot),
 ) -> bool {
     let mut snapshot = shared.lock().unwrap_or_else(|e| e.into_inner());
-    if generation.load(Ordering::Acquire) != expected_generation {
+    if stop.load(Ordering::Acquire) || generation.load(Ordering::Acquire) != expected_generation {
         return false;
     }
     update(&mut snapshot);
@@ -307,10 +406,83 @@ fn commit_generation(
     true
 }
 
-fn notify_changed(notify: &Notification) {
-    let callback = notify.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    if let Some(callback) = callback {
-        callback();
+fn notify_changed(notify: &Notification, stop: &AtomicBool) {
+    if stop.load(Ordering::Acquire) {
+        return;
+    }
+    let callback = notify.lock().unwrap_or_else(|e| e.into_inner());
+    if !stop.load(Ordering::Acquire) {
+        if let Some(callback) = callback.as_ref() {
+            callback();
+        }
+    }
+}
+
+struct WorkerContext {
+    shared: Arc<Mutex<Snapshot>>,
+    stop: Arc<AtomicBool>,
+    generation: Arc<AtomicU64>,
+    notify: Notification,
+}
+
+trait Collector {
+    type Sample;
+    fn sample(&mut self) -> Self::Sample;
+    fn needs_retry(&self) -> bool;
+}
+
+fn collector_worker<C: Collector>(
+    context: WorkerContext,
+    interval: Duration,
+    create: impl FnMut() -> C,
+    publish: impl Fn(&mut Snapshot, C::Sample),
+) {
+    collector_worker_with_clock(context, interval, create, publish, Instant::now);
+}
+
+fn collector_worker_with_clock<C: Collector>(
+    context: WorkerContext,
+    interval: Duration,
+    mut create: impl FnMut() -> C,
+    publish: impl Fn(&mut Snapshot, C::Sample),
+    now: impl Fn() -> Instant,
+) {
+    let mut observed_generation = context.generation.load(Ordering::Acquire);
+    let mut collector = create();
+    let mut previous_tick = now();
+    let mut retry_after = previous_tick + RETRY_INTERVAL;
+    while !context.stop.load(Ordering::Acquire) {
+        let mut started = now();
+        let current_generation = context.generation.load(Ordering::Acquire);
+        if current_generation != observed_generation
+            || started.saturating_duration_since(previous_tick) > RESUME_GAP
+            || (started >= retry_after && collector.needs_retry())
+        {
+            // Creation and destruction remain on this one provider's thread.
+            collector = create();
+            observed_generation = current_generation;
+            // Rebase after both creation and old-provider cleanup. Their duration
+            // is not another suspend gap and must not cause endless recreation.
+            started = now();
+            retry_after = started + RETRY_INTERVAL;
+        }
+        if context.stop.load(Ordering::Acquire) {
+            break;
+        }
+        previous_tick = started;
+        let sample = collector.sample();
+        if commit_generation(
+            &context.shared,
+            &context.generation,
+            &context.stop,
+            observed_generation,
+            |snapshot| publish(snapshot, sample),
+        ) {
+            notify_changed(&context.notify, &context.stop);
+        }
+        if !context.stop.load(Ordering::Acquire) {
+            thread::park_timeout(interval.saturating_sub(now().saturating_duration_since(started)));
+        }
     }
 }
 
@@ -384,12 +556,13 @@ fn busiest_disk(samples: &[(String, f64)]) -> Option<(String, f64)> {
 }
 
 #[cfg(windows)]
-fn fast_worker(
-    shared: Arc<Mutex<Snapshot>>,
-    stop: Arc<AtomicBool>,
-    generation: Arc<AtomicU64>,
-    notify: Notification,
-) {
+fn fast_worker(context: WorkerContext) {
+    let WorkerContext {
+        shared,
+        stop,
+        generation,
+        notify,
+    } = context;
     let mut previous: Option<(CpuTimes, Instant)> = None;
     let mut observed_generation = generation.load(Ordering::Acquire);
     while !stop.load(Ordering::Acquire) {
@@ -432,86 +605,399 @@ fn fast_worker(
                 Metric::unavailable(MetricState::Error, "GetSystemTimes", error)
             }
         };
+        if stop.load(Ordering::Acquire) {
+            break;
+        }
         let memory = native::physical_memory();
-        let committed = commit_generation(&shared, &generation, observed_generation, |snapshot| {
-            snapshot.cpu = cpu;
-            match memory {
-                Ok((total, available)) => match memory_percent(total, available) {
-                    Some((used, percent)) => {
-                        snapshot.ram = Metric::reading(
-                            percent,
-                            "GlobalMemoryStatusEx",
-                            Duration::ZERO,
-                            "사용 중인 물리 메모리 / 전체 물리 메모리",
-                        );
-                        snapshot.memory_total_bytes = total;
-                        snapshot.memory_used_bytes = used;
+        let committed = commit_generation(
+            &shared,
+            &generation,
+            &stop,
+            observed_generation,
+            |snapshot| {
+                snapshot.cpu = cpu;
+                match memory {
+                    Ok((total, available)) => match memory_percent(total, available) {
+                        Some((used, percent)) => {
+                            snapshot.ram = Metric::reading(
+                                percent,
+                                "GlobalMemoryStatusEx",
+                                Duration::ZERO,
+                                "사용 중인 물리 메모리 / 전체 물리 메모리",
+                            );
+                            snapshot.memory_total_bytes = total;
+                            snapshot.memory_used_bytes = used;
+                        }
+                        None => {
+                            snapshot.ram = Metric::unavailable(
+                                MetricState::Error,
+                                "GlobalMemoryStatusEx",
+                                "물리 메모리 범위 오류",
+                            )
+                        }
+                    },
+                    Err(error) => {
+                        snapshot.ram =
+                            Metric::unavailable(MetricState::Error, "GlobalMemoryStatusEx", error)
                     }
-                    None => {
-                        snapshot.ram = Metric::unavailable(
-                            MetricState::Error,
-                            "GlobalMemoryStatusEx",
-                            "물리 메모리 범위 오류",
-                        )
-                    }
-                },
-                Err(error) => {
-                    snapshot.ram =
-                        Metric::unavailable(MetricState::Error, "GlobalMemoryStatusEx", error)
                 }
-            }
-        });
+            },
+        );
         if committed {
-            notify_changed(&notify);
+            notify_changed(&notify, &stop);
         }
-        thread::park_timeout(FAST_INTERVAL.saturating_sub(started.elapsed()));
-    }
-}
-
-#[cfg(windows)]
-fn slow_worker(
-    shared: Arc<Mutex<Snapshot>>,
-    stop: Arc<AtomicBool>,
-    generation: Arc<AtomicU64>,
-    notify: Notification,
-) {
-    let mut observed_generation = generation.load(Ordering::Acquire);
-    let mut providers = native::DeviceProviders::new();
-    let mut previous_tick = Instant::now();
-    let mut retry_after = Instant::now() + Duration::from_secs(30);
-    while !stop.load(Ordering::Acquire) {
-        let started = Instant::now();
-        let current_generation = generation.load(Ordering::Acquire);
-        if current_generation != observed_generation
-            || started.duration_since(previous_tick) > RESUME_GAP
-        {
-            providers = native::DeviceProviders::new();
-            observed_generation = current_generation;
-            retry_after = Instant::now() + Duration::from_secs(30);
-        } else if started >= retry_after && providers.needs_retry() {
-            providers = native::DeviceProviders::new();
-            retry_after = Instant::now() + Duration::from_secs(30);
+        if !stop.load(Ordering::Acquire) {
+            thread::park_timeout(FAST_INTERVAL.saturating_sub(started.elapsed()));
         }
-        previous_tick = started;
-        let sample = providers.sample();
-        let committed = commit_generation(&shared, &generation, observed_generation, |snapshot| {
-            snapshot.gpu = sample.gpu;
-            snapshot.disk = sample.disk;
-            snapshot.npu = sample.npu;
-            snapshot.disk_read_bytes_sec = sample.read;
-            snapshot.disk_write_bytes_sec = sample.write;
-            snapshot.gpu_adapter = sample.gpu_adapter;
-        });
-        if committed {
-            notify_changed(&notify);
-        }
-        thread::park_timeout(SLOW_INTERVAL.saturating_sub(started.elapsed()));
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Condvar, mpsc};
+
+    // Gates, rather than sleeps, establish exactly when a provider is blocked.
+    // The release guard also unblocks detached threads if an assertion panics.
+    #[derive(Default)]
+    struct Gate {
+        open: Mutex<bool>,
+        changed: Condvar,
+    }
+
+    impl Gate {
+        fn wait(&self) {
+            let mut open = self.open.lock().unwrap();
+            while !*open {
+                open = self.changed.wait(open).unwrap();
+            }
+        }
+
+        fn release(&self) {
+            *self.open.lock().unwrap() = true;
+            self.changed.notify_all();
+        }
+    }
+
+    struct ReleaseGate(Arc<Gate>);
+
+    impl Drop for ReleaseGate {
+        fn drop(&mut self) {
+            self.0.release();
+        }
+    }
+
+    struct FakeCollector {
+        value: f64,
+        gate: Option<Arc<Gate>>,
+        entered: Option<mpsc::Sender<()>>,
+        finished: Option<mpsc::Sender<()>>,
+    }
+
+    impl Collector for FakeCollector {
+        type Sample = Metric;
+
+        fn sample(&mut self) -> Metric {
+            if let Some(entered) = self.entered.take() {
+                let _ = entered.send(());
+            }
+            if let Some(gate) = self.gate.take() {
+                gate.wait();
+            }
+            Metric::reading(self.value, "fake", SLOW_INTERVAL, "controlled provider")
+        }
+
+        fn needs_retry(&self) -> bool {
+            false
+        }
+    }
+
+    impl Drop for FakeCollector {
+        fn drop(&mut self) {
+            if let Some(finished) = self.finished.take() {
+                let _ = finished.send(());
+            }
+        }
+    }
+
+    #[test]
+    fn blocked_gpu_does_not_stop_cpu_disk_or_npu_and_does_not_spawn_replacements() {
+        let gate = Arc::new(Gate::default());
+        let _release = ReleaseGate(gate.clone());
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let created = Arc::new(AtomicU64::new(0));
+        let creations = created.clone();
+        let mut telemetry = Telemetry::without_workers();
+        telemetry
+            .spawn_worker("test-blocked-gpu", move |context| {
+                collector_worker(
+                    context,
+                    Duration::from_millis(1),
+                    move || {
+                        creations.fetch_add(1, Ordering::Relaxed);
+                        FakeCollector {
+                            value: 90.0,
+                            gate: Some(gate.clone()),
+                            entered: Some(entered_tx.clone()),
+                            finished: None,
+                        }
+                    },
+                    |snapshot, sample| snapshot.gpu = sample,
+                );
+            })
+            .unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        let (published_tx, published_rx) = mpsc::channel();
+        for sensor in 0..3 {
+            let published = published_tx.clone();
+            telemetry
+                .spawn_worker("test-independent-provider", move |context| {
+                    collector_worker(
+                        context,
+                        Duration::from_millis(1),
+                        || FakeCollector {
+                            value: 20.0 + sensor as f64,
+                            gate: None,
+                            entered: None,
+                            finished: None,
+                        },
+                        move |snapshot, sample| {
+                            match sensor {
+                                0 => snapshot.cpu = sample,
+                                1 => snapshot.disk = sample,
+                                _ => snapshot.npu = sample,
+                            }
+                            let _ = published.send(sensor);
+                        },
+                    );
+                })
+                .unwrap();
+        }
+        let mut updates = [0; 3];
+        while updates.iter().any(|count| *count < 2) {
+            let sensor = published_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            updates[sensor] += 1;
+        }
+        let snapshot = telemetry.snapshot();
+        assert_eq!(snapshot.cpu.value, Some(20.0));
+        assert_eq!(snapshot.disk.value, Some(21.0));
+        assert_eq!(snapshot.npu.value, Some(22.0));
+        assert_eq!(snapshot.gpu.value, None);
+        assert_eq!(created.load(Ordering::Relaxed), 1);
+        assert_eq!(telemetry.workers.len(), 4);
+        assert!(
+            telemetry
+                .spawn_worker("test-excess-worker", |_| {
+                    panic!("a fifth telemetry worker must never start");
+                })
+                .is_err()
+        );
+        // Release before normal shutdown; the separate regression tests detachment.
+        _release.0.release();
+    }
+
+    #[test]
+    fn reset_during_blocked_collection_rejects_old_result_before_fresh_publication() {
+        let old_gate = Arc::new(Gate::default());
+        let fresh_gate = Arc::new(Gate::default());
+        let _release_old = ReleaseGate(old_gate.clone());
+        let _release_fresh = ReleaseGate(fresh_gate.clone());
+        let (old_entered_tx, old_entered_rx) = mpsc::channel();
+        let (fresh_entered_tx, fresh_entered_rx) = mpsc::channel();
+        let (published_tx, published_rx) = mpsc::channel();
+        let created = Arc::new(AtomicU64::new(0));
+        let creations = created.clone();
+        let mut telemetry = Telemetry::without_workers();
+        telemetry
+            .spawn_worker("test-reset-provider", move |context| {
+                collector_worker(
+                    context,
+                    Duration::from_millis(1),
+                    move || {
+                        let incarnation = creations.fetch_add(1, Ordering::Relaxed) + 1;
+                        let (gate, entered) = if incarnation == 1 {
+                            (old_gate.clone(), old_entered_tx.clone())
+                        } else {
+                            (fresh_gate.clone(), fresh_entered_tx.clone())
+                        };
+                        FakeCollector {
+                            value: incarnation as f64,
+                            gate: Some(gate),
+                            entered: Some(entered),
+                            finished: None,
+                        }
+                    },
+                    move |snapshot, sample| {
+                        let value = sample.value;
+                        snapshot.gpu = sample;
+                        let _ = published_tx.send(value);
+                    },
+                );
+            })
+            .unwrap();
+        old_entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        telemetry.reset_baselines();
+        _release_old.0.release();
+        fresh_entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        // The old call has returned, and the new generation is blocked before
+        // committing. A stale publication cannot hide behind a fresh result.
+        assert!(matches!(
+            published_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        let reset = telemetry.snapshot();
+        assert_eq!(reset.sequence, 1);
+        assert_eq!(reset.gpu.state, MetricState::WarmingUp);
+        assert_eq!(reset.gpu.value, None);
+        assert_eq!(created.load(Ordering::Relaxed), 2);
+        _release_fresh.0.release();
+        assert_eq!(
+            published_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Some(2.0)
+        );
+        assert_eq!(telemetry.snapshot().gpu.value, Some(2.0));
+    }
+
+    #[test]
+    fn slow_provider_reinitialization_does_not_trigger_an_endless_warmup_loop() {
+        let old_gate = Arc::new(Gate::default());
+        let release_old = ReleaseGate(old_gate.clone());
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (published_tx, published_rx) = mpsc::channel();
+        let created = Arc::new(AtomicU64::new(0));
+        let creations = created.clone();
+        let clock_millis = Arc::new(AtomicU64::new(0));
+        let init_clock = clock_millis.clone();
+        let origin = Instant::now();
+        let mut telemetry = Telemetry::without_workers();
+        telemetry
+            .spawn_worker("test-slow-initialization", move |context| {
+                collector_worker_with_clock(
+                    context,
+                    Duration::from_millis(1),
+                    move || {
+                        // Model expensive native initialization without a real sleep.
+                        // The next poll must measure its gap from after this work.
+                        init_clock
+                            .fetch_add((RESUME_GAP.as_millis() + 1_000) as u64, Ordering::Relaxed);
+                        let incarnation = creations.fetch_add(1, Ordering::Relaxed) + 1;
+                        FakeCollector {
+                            value: incarnation as f64,
+                            gate: (incarnation == 1).then(|| old_gate.clone()),
+                            entered: (incarnation == 1).then(|| entered_tx.clone()),
+                            finished: None,
+                        }
+                    },
+                    move |snapshot, sample| {
+                        let value = sample.value;
+                        snapshot.gpu = sample;
+                        let _ = published_tx.send(value);
+                    },
+                    move || origin + Duration::from_millis(clock_millis.load(Ordering::Relaxed)),
+                );
+            })
+            .unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        telemetry.reset_baselines();
+        release_old.0.release();
+        // Two later polls must use the same recreated provider. The former bug
+        // recreated it on every poll because initialization exceeded RESUME_GAP.
+        for _ in 0..2 {
+            assert_eq!(
+                published_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+                Some(2.0)
+            );
+        }
+        assert_eq!(created.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn shutdown_has_one_budget_and_late_collectors_cannot_publish_or_notify() {
+        let gate = Arc::new(Gate::default());
+        let _release = ReleaseGate(gate.clone());
+        let early_gate = Arc::new(Gate::default());
+        let release_early = ReleaseGate(early_gate.clone());
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let callbacks = Arc::new(AtomicU64::new(0));
+        let notification_count = callbacks.clone();
+        let mut telemetry = Telemetry::without_workers();
+        telemetry.set_notify(move || {
+            notification_count.fetch_add(1, Ordering::Relaxed);
+        });
+        for sensor in 0..4 {
+            let gate = if sensor == 0 {
+                early_gate.clone()
+            } else {
+                gate.clone()
+            };
+            let entered = entered_tx.clone();
+            let finished = finished_tx.clone();
+            telemetry
+                .spawn_worker("test-shutdown-provider", move |context| {
+                    collector_worker(
+                        context,
+                        Duration::from_millis(1),
+                        move || FakeCollector {
+                            value: 99.0,
+                            gate: Some(gate.clone()),
+                            entered: Some(entered.clone()),
+                            finished: Some(finished.clone()),
+                        },
+                        move |snapshot, sample| match sensor {
+                            0 => snapshot.cpu = sample,
+                            1 => snapshot.gpu = sample,
+                            2 => snapshot.disk = sample,
+                            _ => snapshot.npu = sample,
+                        },
+                    );
+                })
+                .unwrap();
+        }
+        for _ in 0..4 {
+            entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        }
+        let shared = telemetry.shared.clone();
+        let generation = telemetry.generation.clone();
+        let stop = telemetry.stop.clone();
+        let notify = telemetry.notify.clone();
+        telemetry.request_stop();
+        telemetry.request_stop();
+        telemetry.set_notify(|| panic!("a stopped callback must not be reinstalled"));
+        notify_changed(&notify, &stop);
+        // This collector returns while Telemetry is still alive, after the caller
+        // has stopped publication but before the later, bounded Drop wait.
+        release_early.0.release();
+        finished_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(shared.lock().unwrap().sequence, 0);
+        assert_eq!(callbacks.load(Ordering::Relaxed), 0);
+        assert_eq!(generation.load(Ordering::Acquire), 1);
+        let started = Instant::now();
+        drop(telemetry);
+        // Allow scheduling jitter while still rejecting three per-worker budgets.
+        assert!(started.elapsed() < SHUTDOWN_BUDGET + Duration::from_millis(500));
+        assert!(stop.load(Ordering::Acquire));
+        assert_eq!(generation.load(Ordering::Acquire), 1);
+        assert!(notify.lock().unwrap().is_none());
+        assert!(matches!(
+            finished_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        _release.0.release();
+        for _ in 0..3 {
+            finished_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        }
+        let snapshot = shared.lock().unwrap();
+        assert_eq!(snapshot.sequence, 0);
+        for metric in [&snapshot.cpu, &snapshot.gpu, &snapshot.disk, &snapshot.npu] {
+            assert_eq!(metric.value, None);
+            assert_eq!(metric.state, MetricState::WarmingUp);
+        }
+        assert_eq!(callbacks.load(Ordering::Relaxed), 0);
+    }
 
     #[test]
     fn cpu_counts_idle_once_and_normalizes_all_cores() {
@@ -744,6 +1230,7 @@ mod tests {
         assert!(!commit_generation(
             &telemetry.shared,
             &telemetry.generation,
+            &telemetry.stop,
             7,
             |_| {
                 panic!("a pre-reset worker must not publish");
@@ -753,6 +1240,7 @@ mod tests {
         assert!(commit_generation(
             &telemetry.shared,
             &telemetry.generation,
+            &telemetry.stop,
             8,
             |snapshot| {
                 snapshot.cpu = Metric::reading(0.0, "test", FAST_INTERVAL, "fresh baseline");

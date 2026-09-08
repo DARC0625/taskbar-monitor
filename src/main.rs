@@ -21,5 +21,6 @@ fn main() {
         let _ = std::fs::create_dir_all(&directory);
         let path = directory.join("startup-error.txt");
         let _ = std::fs::write(path, format!("Taskbar Monitor startup failed: {error}\n"));
+        std::process::exit(1);
     }
 }

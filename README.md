@@ -8,7 +8,7 @@ CPU·RAM·GPU·디스크·NPU·팬 상태와 장치 이름을 작은 게이지�
 
 **공식 배포는 [v0.4.0](https://github.com/DARC0625/taskbar-monitor/releases/tag/v0.4.0)**입니다. 현재 소스의 **0.4.1은 안정성·자동 검사 개선 후보**이며, 소스 버전 변경이 새 릴리스의 검증·게시 완료를 뜻하지 않습니다.
 
-[사용 안내](packaging/README.ko.txt) · [소스 빌드](BUILD.ko.md) · [자동 검사](docs/testing.md) · [호환성](docs/compatibility.md) · [보안](docs/security-testing.md) · [릴리스 절차](docs/release-process.md)
+[사용 안내](packaging/README.ko.txt) · [소스 빌드](BUILD.ko.md) · [자동 검사](docs/testing.md) · [실제 위젯 검사](docs/runtime-validation.md) · [호환성](docs/compatibility.md) · [보안](docs/security-testing.md) · [릴리스 절차](docs/release-process.md)
 
 ## 화면과 조작
 
@@ -31,6 +31,8 @@ CPU·RAM·GPU·디스크·NPU·팬 상태와 장치 이름을 작은 게이지�
 ## 측정값과 지원 상태
 
 CPU·RAM은 250ms, GPU·디스크 등은 1초 간격으로 수집합니다. 이는 수집 주기이며 화면 표시 지연이나 모든 PC에서의 성능을 보장하는 수치는 아닙니다.
+
+CPU/RAM·GPU·디스크·NPU 수집은 네 개의 고정 작업 스레드로 분리합니다. 한 센서가 응답을 늦게 보내도 다른 수집 경로는 계속 진행하며, 오래된 결과는 갱신 지연으로 구분합니다. 종료 대기와 실제 위젯의 성능 측정 범위는 [안정성 검사 안내](docs/runtime-validation.md)에 설명되어 있습니다.
 
 DISK 게이지는 물리 디스크 중 가장 높은 활성 시간을 표시합니다. 각 항목의 하위 메뉴에서 장치 이름과 측정 내용을 확인할 수 있습니다.
 
