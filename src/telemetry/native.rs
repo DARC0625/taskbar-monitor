@@ -285,29 +285,16 @@ fn counter_scalar(counter: PdhHandle) -> Result<f64, u32> {
     Ok(value.value)
 }
 
-struct PdhCounters {
+struct PdhQuery {
     query: Query,
-    gpu: Result<PdhHandle, u32>,
-    disk: Result<PdhHandle, u32>,
-    read: Result<PdhHandle, u32>,
-    write: Result<PdhHandle, u32>,
     previous_collect: Option<Instant>,
     failed: bool,
 }
 
-impl PdhCounters {
+impl PdhQuery {
     fn new() -> Result<Self, u32> {
-        let query = Query::new()?;
-        let gpu = query.add(r"\GPU Engine(*)\Utilization Percentage");
-        let disk = query.add(r"\PhysicalDisk(*)\% Idle Time");
-        let read = query.add(r"\PhysicalDisk(_Total)\Disk Read Bytes/sec");
-        let write = query.add(r"\PhysicalDisk(_Total)\Disk Write Bytes/sec");
         Ok(Self {
-            query,
-            gpu,
-            disk,
-            read,
-            write,
+            query: Query::new()?,
             previous_collect: None,
             failed: false,
         })
@@ -325,80 +312,102 @@ impl PdhCounters {
             .map(|previous| current.duration_since(previous));
         self.previous_collect = Some(current);
         self.failed = false;
-        Ok(window.filter(|window| *window <= RESUME_GAP))
-    }
-
-    fn needs_retry(&self) -> bool {
-        self.failed
-            || self.gpu.is_err()
-            || self.disk.is_err()
-            || self.read.is_err()
-            || self.write.is_err()
+        Ok(window.filter(|window| !window.is_zero() && *window <= RESUME_GAP))
     }
 }
 
-pub(super) struct DeviceSample {
+struct GpuCounters {
+    pdh: PdhQuery,
+    gpu: Result<PdhHandle, u32>,
+}
+
+impl GpuCounters {
+    fn new() -> Result<Self, u32> {
+        let pdh = PdhQuery::new()?;
+        let gpu = pdh.query.add(r"\GPU Engine(*)\Utilization Percentage");
+        Ok(Self { pdh, gpu })
+    }
+}
+
+struct DiskCounters {
+    pdh: PdhQuery,
+    disk: Result<PdhHandle, u32>,
+    read: Result<PdhHandle, u32>,
+    write: Result<PdhHandle, u32>,
+}
+
+impl DiskCounters {
+    fn new() -> Result<Self, u32> {
+        let pdh = PdhQuery::new()?;
+        let disk = pdh.query.add(r"\PhysicalDisk(*)\% Idle Time");
+        let read = pdh.query.add(r"\PhysicalDisk(_Total)\Disk Read Bytes/sec");
+        let write = pdh.query.add(r"\PhysicalDisk(_Total)\Disk Write Bytes/sec");
+        Ok(Self {
+            pdh,
+            disk,
+            read,
+            write,
+        })
+    }
+}
+
+fn warm(source: &'static str) -> Metric {
+    Metric::unavailable(
+        MetricState::WarmingUp,
+        source,
+        "속도 계산용 두 번째 표본 준비 중",
+    )
+}
+
+pub(super) struct GpuSample {
     pub gpu: Metric,
-    pub disk: Metric,
-    pub npu: Metric,
-    pub read: Metric,
-    pub write: Metric,
-    pub gpu_adapter: String,
+    pub adapter: String,
 }
 
-pub(super) struct DeviceProviders {
-    pdh: Result<PdhCounters, u32>,
-    dxcore: DxCoreDevices,
+pub(super) struct GpuProvider {
+    counters: Result<GpuCounters, u32>,
+    metadata: GpuMetadata,
 }
 
-impl DeviceProviders {
+impl GpuProvider {
     pub fn new() -> Self {
         Self {
-            pdh: PdhCounters::new(),
-            dxcore: DxCoreDevices::new(),
+            counters: GpuCounters::new(),
+            metadata: GpuMetadata::new(),
         }
     }
-    pub fn needs_retry(&self) -> bool {
-        self.pdh.as_ref().map_or(true, PdhCounters::needs_retry) || self.dxcore.needs_retry()
+}
+
+impl super::Collector for GpuProvider {
+    type Sample = GpuSample;
+
+    fn needs_retry(&self) -> bool {
+        self.counters.as_ref().map_or(true, |counters| {
+            counters.pdh.failed || counters.gpu.is_err()
+        }) || self.metadata.needs_retry()
     }
-    pub fn sample(&mut self) -> DeviceSample {
-        let warm = |source| {
-            Metric::unavailable(
-                MetricState::WarmingUp,
-                source,
-                "속도 계산용 두 번째 표본 준비 중",
-            )
-        };
-        let mut sample = DeviceSample {
+
+    fn sample(&mut self) -> GpuSample {
+        let mut sample = GpuSample {
             gpu: warm("PDH GPU Engine"),
-            disk: warm("PDH PhysicalDisk"),
-            read: warm("PDH PhysicalDisk"),
-            write: warm("PDH PhysicalDisk"),
-            npu: self.dxcore.sample_npu(),
-            gpu_adapter: self.dxcore.gpu_names.clone(),
+            adapter: self.metadata.names.clone(),
         };
-        let pdh = match self.pdh.as_mut() {
-            Ok(pdh) => pdh,
+        let counters = match self.counters.as_mut() {
+            Ok(counters) => counters,
             Err(error) => {
                 sample.gpu = pdh_metric(*error, "PDH GPU Engine");
-                sample.disk = pdh_metric(*error, "PDH PhysicalDisk");
-                sample.read = sample.disk.clone();
-                sample.write = sample.disk.clone();
                 return sample;
             }
         };
-        let window = match pdh.collect() {
+        let window = match counters.pdh.collect() {
             Ok(Some(window)) => window,
             Ok(None) => return sample,
             Err(error) => {
                 sample.gpu = pdh_metric(error, "PDH GPU Engine");
-                sample.disk = pdh_metric(error, "PDH PhysicalDisk");
-                sample.read = sample.disk.clone();
-                sample.write = sample.disk.clone();
                 return sample;
             }
         };
-        sample.gpu = match pdh.gpu.and_then(counter_array) {
+        sample.gpu = match counters.gpu.and_then(counter_array) {
             Ok(values) => match busiest_engine(&values) {
                 Some((engine, percent)) => Metric::reading(
                     percent,
@@ -414,7 +423,67 @@ impl DeviceProviders {
             },
             Err(error) => pdh_metric(error, "PDH GPU Engine"),
         };
-        sample.disk = match pdh.disk.and_then(counter_array) {
+        counters.pdh.failed = sample.gpu.state == MetricState::Error;
+        sample
+    }
+}
+
+pub(super) struct DiskSample {
+    pub disk: Metric,
+    pub read: Metric,
+    pub write: Metric,
+}
+
+pub(super) struct DiskProvider {
+    counters: Result<DiskCounters, u32>,
+}
+
+impl DiskProvider {
+    pub fn new() -> Self {
+        Self {
+            counters: DiskCounters::new(),
+        }
+    }
+}
+
+impl super::Collector for DiskProvider {
+    type Sample = DiskSample;
+
+    fn needs_retry(&self) -> bool {
+        self.counters.as_ref().map_or(true, |counters| {
+            counters.pdh.failed
+                || counters.disk.is_err()
+                || counters.read.is_err()
+                || counters.write.is_err()
+        })
+    }
+
+    fn sample(&mut self) -> DiskSample {
+        let mut sample = DiskSample {
+            disk: warm("PDH PhysicalDisk"),
+            read: warm("PDH PhysicalDisk"),
+            write: warm("PDH PhysicalDisk"),
+        };
+        let counters = match self.counters.as_mut() {
+            Ok(counters) => counters,
+            Err(error) => {
+                sample.disk = pdh_metric(*error, "PDH PhysicalDisk");
+                sample.read = sample.disk.clone();
+                sample.write = sample.disk.clone();
+                return sample;
+            }
+        };
+        let window = match counters.pdh.collect() {
+            Ok(Some(window)) => window,
+            Ok(None) => return sample,
+            Err(error) => {
+                sample.disk = pdh_metric(error, "PDH PhysicalDisk");
+                sample.read = sample.disk.clone();
+                sample.write = sample.disk.clone();
+                return sample;
+            }
+        };
+        sample.disk = match counters.disk.and_then(counter_array) {
             Ok(values) => match busiest_disk(&values) {
                 Some((disk, percent)) => Metric::reading(
                     percent,
@@ -430,7 +499,7 @@ impl DeviceProviders {
             },
             Err(error) => pdh_metric(error, "PDH PhysicalDisk"),
         };
-        sample.read = match pdh.read.and_then(counter_scalar) {
+        sample.read = match counters.read.and_then(counter_scalar) {
             Ok(value) => Metric::reading(
                 value,
                 "PDH PhysicalDisk",
@@ -439,7 +508,7 @@ impl DeviceProviders {
             ),
             Err(error) => pdh_metric(error, "PDH PhysicalDisk"),
         };
-        sample.write = match pdh.write.and_then(counter_scalar) {
+        sample.write = match counters.write.and_then(counter_scalar) {
             Ok(value) => Metric::reading(
                 value,
                 "PDH PhysicalDisk",
@@ -448,10 +517,69 @@ impl DeviceProviders {
             ),
             Err(error) => pdh_metric(error, "PDH PhysicalDisk"),
         };
-        pdh.failed = [&sample.gpu, &sample.disk, &sample.read, &sample.write]
+        counters.pdh.failed = [&sample.disk, &sample.read, &sample.write]
             .iter()
             .any(|metric| metric.state == MetricState::Error);
         sample
+    }
+}
+
+// GPU description enumeration stays with GPU collection, never with NPU calls.
+struct GpuMetadata {
+    names: String,
+    list: Option<IDXCoreAdapterList>,
+}
+
+impl GpuMetadata {
+    fn new() -> Self {
+        Self::enumerate().unwrap_or(Self {
+            names: String::new(),
+            list: None,
+        })
+    }
+
+    fn enumerate() -> windows::core::Result<Self> {
+        let factory: IDXCoreAdapterFactory = unsafe { DXCoreCreateAdapterFactory()? };
+        let list: IDXCoreAdapterList =
+            unsafe { factory.CreateAdapterList(&[DXCORE_ADAPTER_ATTRIBUTE_D3D11_GRAPHICS])? };
+        let mut names = Vec::new();
+        for index in 0..unsafe { list.GetAdapterCount() }.min(64) {
+            if let Ok(adapter) = unsafe { list.GetAdapter::<IDXCoreAdapter>(index) } {
+                if property_u8(&adapter, IsHardware).unwrap_or(0) != 0 {
+                    names.push(adapter_name(&adapter));
+                }
+            }
+        }
+        Ok(Self {
+            names: names.join(", "),
+            list: Some(list),
+        })
+    }
+
+    fn needs_retry(&self) -> bool {
+        self.list
+            .as_ref()
+            .is_none_or(|list| unsafe { list.IsStale() })
+    }
+}
+
+pub(super) struct NpuProvider(DxCoreDevices);
+
+impl NpuProvider {
+    pub fn new() -> Self {
+        Self(DxCoreDevices::new())
+    }
+}
+
+impl super::Collector for NpuProvider {
+    type Sample = Metric;
+
+    fn sample(&mut self) -> Metric {
+        self.0.sample_npu()
+    }
+
+    fn needs_retry(&self) -> bool {
+        self.0.needs_retry()
     }
 }
 
@@ -521,7 +649,6 @@ struct NpuEngine {
 
 struct DxCoreDevices {
     npu: Result<Vec<NpuEngine>, Metric>,
-    gpu_names: String,
     list: Option<IDXCoreAdapterList>,
     failed: bool,
 }
@@ -536,7 +663,6 @@ impl DxCoreDevices {
                     "DXCore",
                     format!("DXCore 장치 열거 실패: {error}"),
                 )),
-                gpu_names: String::new(),
                 list: None,
                 failed: true,
             },
@@ -546,22 +672,11 @@ impl DxCoreDevices {
     fn enumerate() -> windows::core::Result<Self> {
         // DXCore is COM-like but does not require COM apartment initialization.
         let factory: IDXCoreAdapterFactory = unsafe { DXCoreCreateAdapterFactory()? };
-        let graphics: IDXCoreAdapterList =
-            unsafe { factory.CreateAdapterList(&[DXCORE_ADAPTER_ATTRIBUTE_D3D11_GRAPHICS])? };
-        let mut gpu_names = Vec::new();
-        for index in 0..unsafe { graphics.GetAdapterCount() }.min(64) {
-            if let Ok(adapter) = unsafe { graphics.GetAdapter::<IDXCoreAdapter>(index) } {
-                if property_u8(&adapter, IsHardware).unwrap_or(0) != 0 {
-                    gpu_names.push(adapter_name(&adapter));
-                }
-            }
-        }
         let npus: IDXCoreAdapterList =
             unsafe { factory.CreateAdapterList(&[NPU_HARDWARE_ATTRIBUTE])? };
         let count = unsafe { npus.GetAdapterCount() };
         let mut devices = Self {
             npu: Ok(Vec::new()),
-            gpu_names: gpu_names.join(", "),
             list: Some(npus.clone()),
             failed: false,
         };

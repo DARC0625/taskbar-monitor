@@ -5,16 +5,19 @@ use crate::{
     taskbar_host::{self, TaskbarHost},
     telemetry::{Metric, MetricState, Snapshot, Telemetry},
 };
+#[path = "widget_stats.rs"]
+mod widget_stats;
 use std::{
     mem::size_of,
     sync::mpsc::{self, Receiver, TryRecvError},
     time::{Duration, Instant},
 };
+use widget_stats::WidgetStats;
 use windows::{
     Win32::{
         Foundation::*,
         Graphics::Gdi::*,
-        System::{Com::*, LibraryLoader::GetModuleHandleW, Registry::*, Threading::CreateMutexW},
+        System::{Com::*, LibraryLoader::GetModuleHandleW, Registry::*, Threading::*},
         UI::{HiDpi::*, Input::KeyboardAndMouse::*, Shell::*, WindowsAndMessaging::*},
     },
     core::{PCWSTR, Result, w},
@@ -43,7 +46,7 @@ struct App {
     paints: u64,
     draw_errors: u64,
     last_cpu_sample: Option<Instant>,
-    latency: Vec<f64>,
+    diagnostics: Option<WidgetStats>,
     save_error: bool,
     menu_open: bool,
     last_cells: Vec<Cell>,
@@ -60,15 +63,43 @@ struct App {
     attach_count: u64,
     attach_error: String,
     last_verified_host: serde_json::Value,
-    last_renderer_stats: Option<RendererStats>,
+    retired_renderer_stats: RendererStats,
+    last_software_fallback: Option<bool>,
+}
+
+impl App {
+    fn retire_renderer(&mut self) {
+        if let Some(renderer) = self.renderer.take() {
+            self.retired_renderer_stats.accumulate(renderer.stats());
+            self.last_software_fallback = Some(renderer.software_fallback());
+        }
+    }
 }
 
 pub fn run(args: &[String]) -> Result<()> {
     unsafe {
+        let target = parse_control_target(args)
+            .map_err(|message| windows::core::Error::new(E_INVALIDARG, message))?;
         for (argument, message) in [("--reattach", REATTACH), ("--report-now", REPORT_NOW)] {
             if args.iter().any(|s| s == argument) {
-                if let Ok(hwnd) = FindWindowW(CONTROL_CLASS, PCWSTR::null()) {
-                    let _ = PostMessageW(Some(hwnd), message, WPARAM(0), LPARAM(0));
+                match FindWindowW(CONTROL_CLASS, PCWSTR::null()) {
+                    Ok(hwnd) => {
+                        if let Some(target) = target {
+                            verify_control_target(hwnd, target)?;
+                            // The receiver checks the same identity again. HWND/PID reuse
+                            // between this check and delivery cannot redirect the request.
+                            PostMessageW(
+                                Some(hwnd),
+                                message,
+                                WPARAM(target.process_id as usize),
+                                LPARAM(target.created_100ns as isize),
+                            )?;
+                        } else {
+                            PostMessageW(Some(hwnd), message, WPARAM(0), LPARAM(0))?;
+                        }
+                    }
+                    Err(error) if target.is_some() => return Err(error),
+                    Err(_) => {}
                 }
                 return Ok(());
             }
@@ -108,6 +139,9 @@ pub fn run(args: &[String]) -> Result<()> {
         }
         let config = Config::load();
         let light = is_light(&config.theme);
+        let start = Instant::now();
+        let report = arg(args, "--report");
+        let diagnostics = report.as_ref().map(|_| WidgetStats::new(start));
         let mut app = Box::new(App {
             config,
             telemetry: Telemetry::start(),
@@ -117,15 +151,15 @@ pub fn run(args: &[String]) -> Result<()> {
             last_rect: RECT::default(),
             visible: false,
             dragging: None,
-            start: Instant::now(),
+            start,
             end_after: arg(args, "--seconds")
                 .and_then(|s| s.parse::<u64>().ok())
-                .map(|s| Duration::from_secs(s.clamp(1, 300))),
-            report: arg(args, "--report"),
+                .map(|s| Duration::from_secs(s.clamp(1, 86_400))),
+            report,
             paints: 0,
             draw_errors: 0,
             last_cpu_sample: None,
-            latency: Vec::with_capacity(1200),
+            diagnostics,
             save_error: false,
             menu_open: false,
             last_cells: Vec::new(),
@@ -142,8 +176,12 @@ pub fn run(args: &[String]) -> Result<()> {
             attach_count: 0,
             attach_error: String::new(),
             last_verified_host: serde_json::Value::Null,
-            last_renderer_stats: None,
+            retired_renderer_stats: RendererStats::default(),
+            last_software_fallback: None,
         });
+        if let Some(stats) = &mut app.diagnostics {
+            stats.sample_resources(true);
+        }
         refresh_hardware(&mut app);
         let hwnd = CreateWindowExW(
             WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
@@ -176,7 +214,9 @@ pub fn run(args: &[String]) -> Result<()> {
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
-        write_report(&app);
+        if !app.shutting_down {
+            write_report(&mut app, "message_loop_exited");
+        }
         drop(app);
         CoUninitialize();
         let _ = CloseHandle(guard);
@@ -186,6 +226,119 @@ pub fn run(args: &[String]) -> Result<()> {
 
 fn arg(args: &[String], key: &str) -> Option<String> {
     args.windows(2).find(|s| s[0] == key).map(|s| s[1].clone())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ControlTarget {
+    process_id: u32,
+    created_100ns: u64,
+}
+
+fn parse_control_target(
+    args: &[String],
+) -> std::result::Result<Option<ControlTarget>, &'static str> {
+    let keys = ["--target-pid", "--target-start-time"];
+    let present = keys.map(|key| {
+        args.iter()
+            .filter(|argument| argument.as_str() == key)
+            .count()
+    });
+    if present == [0, 0] {
+        return Ok(None);
+    }
+    if present != [1, 1]
+        || args
+            .iter()
+            .filter(|argument| matches!(argument.as_str(), "--reattach" | "--report-now"))
+            .count()
+            != 1
+        || args.iter().any(|argument| argument == "--quit")
+    {
+        return Err(
+            "Target identity requires one control command and exactly one PID/start-time pair",
+        );
+    }
+    let number = |key| -> std::result::Result<u64, &'static str> {
+        let value = arg(args, key).ok_or("Missing target identity value")?;
+        if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err("Target identity must contain positive decimal integers");
+        }
+        value
+            .parse::<u64>()
+            .map_err(|_| "Target identity is outside its integer range")
+    };
+    let process_id = number(keys[0])?;
+    let created_100ns = number(keys[1])?;
+    if process_id == 0
+        || process_id > u64::from(u32::MAX)
+        || created_100ns == 0
+        || created_100ns > isize::MAX as u64
+    {
+        return Err("Target identity is outside the supported Windows x64 range");
+    }
+    Ok(Some(ControlTarget {
+        process_id: process_id as u32,
+        created_100ns,
+    }))
+}
+
+unsafe fn process_creation_time(process: HANDLE) -> Result<u64> {
+    let (mut created, mut exited, mut kernel, mut user) = (
+        FILETIME::default(),
+        FILETIME::default(),
+        FILETIME::default(),
+        FILETIME::default(),
+    );
+    GetProcessTimes(process, &mut created, &mut exited, &mut kernel, &mut user)?;
+    Ok((u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime))
+}
+
+unsafe fn verify_control_target(hwnd: HWND, target: ControlTarget) -> Result<()> {
+    let mut process_id = 0;
+    GetWindowThreadProcessId(hwnd, Some(&mut process_id));
+    if process_id != target.process_id {
+        return Err(windows::core::Error::new(
+            E_INVALIDARG,
+            "Controller belongs to a different process",
+        ));
+    }
+    let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, process_id)?;
+    let created = process_creation_time(process);
+    let _ = CloseHandle(process);
+    if created? != target.created_100ns {
+        return Err(windows::core::Error::new(
+            E_INVALIDARG,
+            "Controller process creation time differs",
+        ));
+    }
+    Ok(())
+}
+
+fn control_message_matches(
+    current: ControlTarget,
+    process_id: usize,
+    created_100ns: isize,
+) -> bool {
+    (process_id == 0 && created_100ns == 0)
+        || (process_id == current.process_id as usize
+            && created_100ns > 0
+            && created_100ns as u64 == current.created_100ns)
+}
+
+unsafe fn accept_control_message(wp: WPARAM, lp: LPARAM) -> bool {
+    if wp.0 == 0 && lp.0 == 0 {
+        return true;
+    }
+    process_creation_time(GetCurrentProcess()).is_ok_and(|created_100ns| {
+        control_message_matches(
+            ControlTarget {
+                process_id: GetCurrentProcessId(),
+                created_100ns,
+            },
+            wp.0,
+            lp.0,
+        )
+    })
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
@@ -209,9 +362,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let width = (lp.0 as u32) & 0xffff;
             let height = (lp.0 as u32 >> 16) & 0xffff;
             if width > 0 && height > 0 {
-                if renderer.resize(width, height).is_err() {
+                if let Err(error) = renderer.resize(width, height) {
                     retire_renderer(ptr);
                     (*ptr).draw_errors += 1;
+                    if let Some(stats) = &mut (*ptr).diagnostics {
+                        stats.record_error("resize", &error);
+                    }
                 }
             }
         }
@@ -219,6 +375,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
     }
     match msg {
         REATTACH => {
+            if !accept_control_message(wp, lp) {
+                return LRESULT(0);
+            }
             if !(*ptr).menu_open {
                 discard_widget(ptr);
                 maintain_attachment(ptr);
@@ -226,7 +385,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             LRESULT(0)
         }
         REPORT_NOW => {
-            write_report(&*ptr);
+            if !accept_control_message(wp, lp) {
+                return LRESULT(0);
+            }
+            write_report(&mut *ptr, "on_demand");
             LRESULT(0)
         }
         WM_PAINT if hwnd == (*ptr).widget => {
@@ -235,18 +397,32 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let app = &mut *ptr;
             let snapshot = app.telemetry.snapshot();
             let cells = cells(&snapshot, &app.config, &app.hardware);
+            if app.renderer.is_none() {
+                match Renderer::new(hwnd) {
+                    Ok(renderer) => {
+                        app.renderer = Some(renderer);
+                        if let Some(stats) = &mut app.diagnostics {
+                            stats.renderer_created();
+                        }
+                    }
+                    Err(error) => {
+                        if let Some(stats) = &mut app.diagnostics {
+                            stats.record_error("renderer_init", &error);
+                        }
+                    }
+                }
+            }
             let drawn = if let Some(renderer) = app.renderer.as_mut() {
-                let ok = renderer.draw(&cells, app.light, &app.config.style).is_ok();
-                if !ok {
-                    app.renderer = None;
+                match renderer.draw(&cells, app.light, &app.config.style) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        app.retire_renderer();
+                        if let Some(stats) = &mut app.diagnostics {
+                            stats.record_error("paint", &error);
+                        }
+                        false
+                    }
                 }
-                ok
-            } else if let Ok(mut renderer) = Renderer::new(hwnd) {
-                let ok = renderer.draw(&cells, app.light, &app.config.style).is_ok();
-                if ok {
-                    app.renderer = Some(renderer);
-                }
-                ok
             } else {
                 false
             };
@@ -256,14 +432,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             } else {
                 app.draw_errors += 1;
             }
-            if drawn
+            if let Some(stats) = &mut app.diagnostics {
+                stats.paint_finished(drawn);
+            }
+            if app.diagnostics.is_some()
+                && drawn
                 && snapshot.cpu.state == MetricState::Ready
                 && app.last_cpu_sample != Some(snapshot.cpu.sampled_at)
             {
                 app.last_cpu_sample = Some(snapshot.cpu.sampled_at);
-                if app.latency.len() < 1200 {
-                    app.latency
-                        .push(snapshot.cpu.sampled_at.elapsed().as_secs_f64() * 1000.0);
+                if let Some(stats) = &mut app.diagnostics {
+                    stats.record_latency(snapshot.cpu.sampled_at, Instant::now());
                 }
             }
             let _ = EndPaint(hwnd, &ps);
@@ -284,6 +463,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 (*ptr).visible_ticks += 1;
             } else {
                 (*ptr).hidden_ticks += 1;
+            }
+            if let Some(stats) = &mut (*ptr).diagnostics {
+                stats.sample_resources(false);
             }
             if (*ptr)
                 .end_after
@@ -359,6 +541,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_CLOSE => {
             if hwnd == (*ptr).controller {
+                // Preserve live HWND/resource state before releasing the renderer.
+                write_report(&mut *ptr, "before_shutdown");
+                // Clear the callback while its controller HWND still belongs to us.
+                (*ptr).telemetry.request_stop();
                 (*ptr).shutting_down = true;
                 discard_widget(ptr);
                 let _ = DestroyWindow(hwnd);
@@ -375,6 +561,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 PostQuitMessage(0);
             } else if hwnd == (*ptr).widget {
                 // Explorer may destroy its child. The controller and collectors survive.
+                if let Some(stats) = &mut (*ptr).diagnostics {
+                    stats.external_widget_destroyed();
+                }
                 retire_renderer(ptr);
                 (*ptr).widget = HWND::default();
                 (*ptr).dragging = None;
@@ -404,9 +593,7 @@ unsafe fn redraw_widget(ptr: *mut App) {
 }
 
 unsafe fn retire_renderer(ptr: *mut App) {
-    if let Some(renderer) = (*ptr).renderer.take() {
-        (*ptr).last_renderer_stats = Some(renderer.stats());
-    }
+    (*ptr).retire_renderer();
 }
 unsafe fn discard_widget(ptr: *mut App) {
     let old = (*ptr).widget;
@@ -452,6 +639,9 @@ unsafe fn maintain_attachment(ptr: *mut App) {
             (*ptr).attach_error = "작업표시줄 DPI 설정을 맞추지 못했습니다".into();
             return;
         }
+        if let Some(stats) = &mut (*ptr).diagnostics {
+            stats.attach_attempted();
+        }
         let created = CreateWindowExW(
             WS_EX_NOREDIRECTIONBITMAP | WS_EX_NOACTIVATE | WS_EX_NOPARENTNOTIFY,
             CLASS,
@@ -470,6 +660,9 @@ unsafe fn maintain_attachment(ptr: *mut App) {
         let child = match created {
             Ok(child) => child,
             Err(error) => {
+                if let Some(stats) = &mut (*ptr).diagnostics {
+                    stats.record_error("attach", &error);
+                }
                 (*ptr).attach_error = format!("작업표시줄 연결 실패: {error}");
                 return;
             }
@@ -482,8 +675,16 @@ unsafe fn maintain_attachment(ptr: *mut App) {
         (*ptr).widget = child;
         (*ptr).host = Some(host);
         match Renderer::new(child) {
-            Ok(renderer) => (*ptr).renderer = Some(renderer),
+            Ok(renderer) => {
+                (*ptr).renderer = Some(renderer);
+                if let Some(stats) = &mut (*ptr).diagnostics {
+                    stats.renderer_created();
+                }
+            }
             Err(error) => {
+                if let Some(stats) = &mut (*ptr).diagnostics {
+                    stats.record_error("renderer_init", &error);
+                }
                 (*ptr).attach_error = format!("그리기 초기화 실패: {error}");
                 discard_widget(ptr);
                 return;
@@ -541,6 +742,7 @@ unsafe fn verify_host(ptr: *mut App, host: TaskbarHost) {
     let _ = GetWindowRect(child, &mut child_rect);
     let _ = GetWindowRect(host.hwnd, &mut parent_rect);
     (*ptr).last_verified_host = serde_json::json!({
+        "observed_at_uptime_seconds":(*ptr).start.elapsed().as_secs_f64(),
         "child_hwnd":child.0 as usize,"parent_hwnd":parent.0 as usize,"taskbar_hwnd":host.hwnd.0 as usize,
         "parent_is_taskbar":parent==host.hwnd,"root_is_taskbar":root==host.hwnd,
         "child_process_id":taskbar_host::process_id(child),"host_process_id":host.process_id,
@@ -978,24 +1180,52 @@ unsafe fn save(ptr: *mut App) {
     (*ptr).save_error = (*ptr).config.save().is_err();
 }
 
-fn write_report(app: &App) {
+fn write_report(app: &mut App, phase: &str) {
+    if app.report.is_none() {
+        return;
+    }
+    if let Some(stats) = &mut app.diagnostics {
+        stats.sample_resources(true);
+    }
     if let Some(path) = &app.report {
-        let mut values = app.latency.clone();
-        values.sort_by(f64::total_cmp);
-        let percentile = |p: f64| {
-            values
-                .get(((values.len().saturating_sub(1)) as f64 * p).round() as usize)
-                .copied()
+        let mut renderer_stats = app.retired_renderer_stats;
+        if let Some(renderer) = &app.renderer {
+            renderer_stats.accumulate(renderer.stats());
+        }
+        let widget_state = unsafe {
+            let exists = !app.widget.0.is_null() && IsWindow(Some(app.widget)).as_bool();
+            let parent = if exists {
+                GetParent(app.widget).ok()
+            } else {
+                None
+            };
+            serde_json::json!({
+                "widget_exists":exists,
+                "host_is_current":app.host.is_some_and(|host| host.is_current()),
+                "parent_is_expected_taskbar":parent.is_some() && parent == app.host.map(|host| host.hwnd),
+                "win32_visible":exists && IsWindowVisible(app.widget).as_bool(),
+                "last_policy_visible":app.visible,
+                "visibility_caveat":"IsWindowVisible is a window/ancestor style check, not proof of unclipped, unoccluded or physically visible pixels",
+                "menu_open":app.menu_open,"renderer_available":app.renderer.is_some(),
+                "shutting_down":app.shutting_down,
+                "client_rect":[app.last_rect.left,app.last_rect.top,app.last_rect.right,app.last_rect.bottom]
+            })
         };
         let report = serde_json::json!({"elapsed_seconds":app.start.elapsed().as_secs_f64(),"paints":app.paints,"draw_errors":app.draw_errors,
+            "schema_version":2,"mode":"live_widget_diagnostics","report_phase":phase,
+            "uptime_clock":"monotonic Instant elapsed since GUI initialization; timer gaps are not active display time",
             "hosting":"taskbar-child","attach_count":app.attach_count,"attach_error":app.attach_error,
+            "successful_reattachments":app.attach_count.saturating_sub(1),"widget_state":widget_state,
+            "lifecycle":app.diagnostics.as_ref().map(WidgetStats::lifecycle_report),
             "last_verified_host":app.last_verified_host,"inspection_changes_hosting":false,
             "inspection_mode":app.inspect,"visible_policy_ticks":app.visible_ticks,"hidden_policy_ticks":app.hidden_ticks,
-            "cpu_sample_to_present_return_ms":{"count":values.len(),"p50":percentile(0.5),"p95":percentile(0.95),"max":values.last()},
+            "visibility_tick_caveat":"500 ms maintenance observations, including posted maintenance messages; not elapsed visible/hidden duration",
+            "cpu_sample_to_present_return_ms":app.diagnostics.as_ref().map(WidgetStats::latency_report),
+            "process_resources":app.diagnostics.as_ref().map(WidgetStats::resource_report),
             "display_completion_caveat":"CPU sample to EndDraw and DXGI Present return; not physical screen scanout",
             "composition":"DirectComposition per-pixel premultiplied alpha",
-            "software_fallback":app.renderer.as_ref().map(Renderer::software_fallback),
-            "renderer_stats":app.renderer.as_ref().map(Renderer::stats).or(app.last_renderer_stats),
+            "software_fallback":app.renderer.as_ref().map(Renderer::software_fallback).or(app.last_software_fallback),
+            "renderer_stats":renderer_stats,"renderer_stats_scope":"all renderer instances since GUI initialization, including retired instances",
             "version":env!("CARGO_PKG_VERSION"),
             "hardware":{"cpu":app.hardware.cpu_detail,"ram":app.hardware.ram_detail,"gpu":app.hardware.gpu_detail,"disk":app.hardware.disk_detail},
             "widget_rect_coordinates":"taskbar client pixels; use last_verified_host for screen coordinates",
@@ -1007,6 +1237,89 @@ fn write_report(app: &App) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn targeted_control_requires_a_complete_strict_identity_pair() {
+        let parse = |args: &[&str]| {
+            parse_control_target(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+        };
+        assert_eq!(parse(&["app", "--reattach"]), Ok(None));
+        assert_eq!(
+            parse(&[
+                "app",
+                "--report-now",
+                "--target-pid",
+                "42",
+                "--target-start-time",
+                "123456"
+            ]),
+            Ok(Some(ControlTarget {
+                process_id: 42,
+                created_100ns: 123456
+            }))
+        );
+        for args in [
+            vec!["--reattach", "--target-pid", "42"],
+            vec!["--target-pid", "42", "--target-start-time", "123456"],
+            vec![
+                "--quit",
+                "--target-pid",
+                "42",
+                "--target-start-time",
+                "123456",
+            ],
+            vec![
+                "--reattach",
+                "--target-pid",
+                "0",
+                "--target-start-time",
+                "123456",
+            ],
+            vec![
+                "--reattach",
+                "--target-pid",
+                "+42",
+                "--target-start-time",
+                "123456",
+            ],
+            vec![
+                "--reattach",
+                "--target-pid",
+                "4294967296",
+                "--target-start-time",
+                "123456",
+            ],
+            vec![
+                "--reattach",
+                "--target-pid",
+                "42",
+                "--target-start-time",
+                "18446744073709551615",
+            ],
+            vec![
+                "--reattach",
+                "--target-pid",
+                "42",
+                "--target-start-time",
+                "123456",
+                "--target-pid",
+                "42",
+            ],
+        ] {
+            assert!(parse(&args).is_err(), "{args:?}");
+        }
+    }
+    #[test]
+    fn targeted_messages_reject_reused_pid_or_hwnd_but_keep_legacy_commands() {
+        let current = ControlTarget {
+            process_id: 42,
+            created_100ns: 123456,
+        };
+        assert!(control_message_matches(current, 0, 0));
+        assert!(control_message_matches(current, 42, 123456));
+        for (pid, time) in [(41, 123456), (42, 123455), (0, 123456), (42, 0), (42, -1)] {
+            assert!(!control_message_matches(current, pid, time));
+        }
+    }
     #[test]
     fn disk_model_follows_reported_physical_index() {
         assert_eq!(
