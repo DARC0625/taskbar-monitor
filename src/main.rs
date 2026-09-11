@@ -7,6 +7,7 @@ mod diagnostics;
 mod hardware;
 mod render;
 mod shell;
+mod startup;
 mod taskbar_host;
 mod telemetry;
 

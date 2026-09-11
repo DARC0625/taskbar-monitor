@@ -11,6 +11,8 @@
 ; https://jrsoftware.org/ishelp/topic_setup_setupmutex.htm
 ; https://jrsoftware.org/ishelp/topic_scriptdll.htm
 ; https://jrsoftware.org/ishelp/topic_isxfunc_findwindowbyclassname.htm
+; https://jrsoftware.org/ishelp/topic_isxfunc_wizardselecttasks.htm
+; https://jrsoftware.org/ishelp/topic_setupcmdline.htm
 
 #ifndef PayloadDir
   #error "Pass /DPayloadDir=<absolute payload directory>"
@@ -108,9 +110,11 @@ Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExeName}"; WorkingDir: "{app}"
 Name: "{userdesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; WorkingDir: "{app}"; Tasks: desktopicon
 
 [Registry]
-Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "TaskbarMonitor"; ValueData: """{app}\{#AppExeName}"""; Flags: uninsdeletevalue; Tasks: autostart
-; Unchecking a previously selected task during an upgrade disables only our value.
-Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: none; ValueName: "TaskbarMonitor"; Flags: deletevalue dontcreatekey; Tasks: not autostart
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "TaskbarMonitor"; ValueData: """{app}\{#AppExeName}"""; Tasks: autostart
+; A portable copy may own the same per-user value. An unchecked task must not
+; delete its registration. Uninstall cleanup below also handles app opt-in
+; after an installation whose autostart task was never selected.
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: none; ValueName: "TaskbarMonitor"; Flags: deletevalue dontcreatekey; Tasks: not autostart; Check: StartupBelongsToInstall
 
 [Run]
 Filename: "{app}\{#AppExeName}"; WorkingDir: "{app}"; Description: "{cm:RunApplication}"; Flags: nowait postinstall skipifsilent
@@ -125,6 +129,82 @@ const
   ProcessSynchronize = $00100000;
   WaitObjectSignaled = 0;
   WaitTimedOut = $00000102;
+  StartupKey = 'Software\Microsoft\Windows\CurrentVersion\Run';
+  StartupValueName = 'TaskbarMonitor';
+
+var
+  StartupDefaultApplied: Boolean;
+
+function StartupMatchesDirectory(const Command, Directory: String): Boolean;
+begin
+  Result := (Directory <> '') and
+    (CompareText(Command, '"' + AddBackslash(Directory) + '{#AppExeName}"') = 0);
+end;
+
+function StartupBelongsToInstall: Boolean;
+var
+  Command: String;
+begin
+  Result := False;
+  if not RegQueryStringValue(HKCU, StartupKey, StartupValueName, Command) then
+    Exit;
+  Result := StartupMatchesDirectory(Command, ExpandConstant('{app}'));
+  if not Result and not IsUninstaller then
+    Result := StartupMatchesDirectory(Command, WizardForm.PrevAppDir);
+end;
+
+function HasExplicitStartupTasks: Boolean;
+var
+  Index: Integer;
+  Argument, MergedTasks: String;
+begin
+  Result := False;
+  for Index := 1 to ParamCount do
+  begin
+    Argument := Lowercase(ParamStr(Index));
+    // /LOADINF supplies a saved set after Inno parses command-line tasks.
+    if Pos('/loadinf=', Argument) = 1 then
+    begin
+      Result := True;
+      Exit;
+    end;
+    // Inno uses the final /TASKS or /MERGETASKS occurrence.
+    if Pos('/tasks=', Argument) = 1 then
+      Result := True
+    else if Pos('/mergetasks=', Argument) = 1 then
+    begin
+      MergedTasks := ',' + Copy(Argument, 13, Length(Argument)) + ',';
+      StringChangeEx(MergedTasks, ' ', '', True);
+      StringChangeEx(MergedTasks, #9, '', True);
+      Result := (Pos(',autostart,', MergedTasks) > 0) or
+         (Pos(',!autostart,', MergedTasks) > 0) or
+         (Pos(',*autostart,', MergedTasks) > 0);
+    end;
+  end;
+end;
+
+procedure CurPageChanged(CurPageID: Integer);
+begin
+  // Inno creates/restores task controls when it enters wpSelectTasks, after
+  // InitializeWizard. Silent setup traverses the same pages. Apply once so
+  // Back/Next navigation cannot replace a selection the user just changed.
+  if (CurPageID <> wpSelectTasks) or StartupDefaultApplied then
+    Exit;
+  StartupDefaultApplied := True;
+  if HasExplicitStartupTasks then
+    Exit;
+  if StartupBelongsToInstall then
+    WizardSelectTasks('autostart')
+  else
+    WizardSelectTasks('!autostart');
+end;
+
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+begin
+  if (CurUninstallStep = usUninstall) and StartupBelongsToInstall then
+    if not RegDeleteValue(HKCU, StartupKey, StartupValueName) then
+      Log('Could not remove this installation''s Windows startup registration.');
+end;
 
 function GetTickCount64: Int64;
   external 'GetTickCount64@kernel32.dll stdcall';
