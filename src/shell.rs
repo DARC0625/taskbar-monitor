@@ -2,6 +2,7 @@ use crate::{
     config::Config,
     hardware::{self, HardwareInfo},
     render::{Cell, Renderer, RendererStats},
+    startup::{self, StartupState},
     taskbar_host::{self, TaskbarHost},
     telemetry::{Metric, MetricState, Snapshot, Telemetry},
 };
@@ -29,6 +30,8 @@ const DATA_READY: u32 = WM_APP + 1;
 const TRAY_EVENT: u32 = WM_APP + 2;
 const REATTACH: u32 = WM_APP + 3;
 const REPORT_NOW: u32 = WM_APP + 4;
+const STARTUP_TOGGLE: usize = 50;
+const STARTUP_SETTINGS: usize = 51;
 const LABELS: [&str; 6] = ["CPU", "RAM", "GPU", "DISK", "NPU", "FAN"];
 
 struct App {
@@ -959,6 +962,9 @@ unsafe fn open_menu(hwnd: HWND, ptr: *mut App) {
     let Ok(menu) = CreatePopupMenu() else {
         return;
     };
+    // Read on demand so installer changes are reflected without polling or a
+    // second preference that can disagree with Windows' Run registration.
+    let startup_state = startup::read();
     {
         let app = &*ptr;
         let snapshot = app.telemetry.snapshot();
@@ -1095,6 +1101,34 @@ unsafe fn open_menu(hwnd: HWND, ptr: *mut App) {
             item(sub, 0, "왼쪽 버튼으로 끌어서 위치 이동", false, true);
             submenu(menu, sub, "위치 · 크기");
         }
+        item(
+            menu,
+            STARTUP_TOGGLE,
+            "Windows 로그인 시 자동 실행",
+            matches!(startup_state, Ok(StartupState::Enabled)),
+            !matches!(
+                startup_state,
+                Ok(StartupState::Enabled | StartupState::Disabled)
+            ),
+        );
+        match &startup_state {
+            Ok(StartupState::OtherRegistration) => item(
+                menu,
+                0,
+                "자동 실행: 다른 실행 경로가 등록되어 있음",
+                false,
+                true,
+            ),
+            Err(_) => item(menu, 0, "자동 실행 상태를 확인하지 못했습니다", false, true),
+            _ => {}
+        }
+        item(
+            menu,
+            STARTUP_SETTINGS,
+            "Windows 시작 앱 설정…",
+            false,
+            false,
+        );
         if app.save_error {
             item(menu, 0, "설정 저장 실패: 폴더 쓰기 권한 확인", false, true);
         }
@@ -1161,6 +1195,37 @@ unsafe fn open_menu(hwnd: HWND, ptr: *mut App) {
         40..=42 => {
             (*ptr).config.style = ["hud", "eva", "minimal"][(choice - 40) as usize].into();
         }
+        50 => {
+            let enabled = match startup_state {
+                Ok(StartupState::Disabled) => Some(true),
+                Ok(StartupState::Enabled) => Some(false),
+                _ => None,
+            };
+            if let Some(enabled) = enabled {
+                if let Err(error) = startup::set_enabled(enabled) {
+                    show_startup_error(
+                        hwnd,
+                        &format!("자동 실행 설정을 변경하지 못했습니다.\n\n{error}"),
+                    );
+                }
+            }
+        }
+        51 => {
+            let opened = ShellExecuteW(
+                Some(hwnd),
+                w!("open"),
+                w!("ms-settings:startupapps"),
+                None,
+                None,
+                SW_SHOWNORMAL,
+            );
+            if opened.0 as isize <= 32 {
+                show_startup_error(
+                    hwnd,
+                    "Windows 시작 앱 설정을 열지 못했습니다.\nWindows 설정의 앱 → 시작 프로그램에서 확인해 주세요.",
+                );
+            }
+        }
         99 => {
             let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
         }
@@ -1174,6 +1239,16 @@ unsafe fn open_menu(hwnd: HWND, ptr: *mut App) {
         let _ = PostMessageW(Some(hwnd), WM_TIMER, WPARAM(1), LPARAM(0));
         redraw_widget(ptr);
     }
+}
+
+unsafe fn show_startup_error(hwnd: HWND, message: &str) {
+    let text: Vec<u16> = message.encode_utf16().chain(Some(0)).collect();
+    let _ = MessageBoxW(
+        Some(hwnd),
+        PCWSTR(text.as_ptr()),
+        w!("Taskbar Monitor · 자동 실행"),
+        MB_OK | MB_ICONERROR,
+    );
 }
 
 unsafe fn save(ptr: *mut App) {
