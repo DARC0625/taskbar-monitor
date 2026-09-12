@@ -8,7 +8,7 @@ on:
         type: boolean
         default: false
       windows11_verified:
-        description: Completed docs/compatibility.md checks for this candidate in a clean Windows 11 VM
+        description: Recorded this candidate's Windows 11 checks and untested scope in an authorized interactive environment
         type: boolean
         default: false
       verified_candidate_run_id:

@@ -6,7 +6,7 @@
 
 CPU·RAM·GPU·디스크·NPU·팬 상태와 장치 이름을 작은 게이지로 표시합니다. 기본 모니터의 가로 작업표시줄을 대상으로 합니다.
 
-**공식 배포는 [v0.4.0](https://github.com/DARC0625/taskbar-monitor/releases/tag/v0.4.0)**입니다. 현재 소스의 **0.4.1은 안정성·자동 검사 개선 후보**이며, 소스 버전 변경이 새 릴리스의 검증·게시 완료를 뜻하지 않습니다.
+**공식 설치 파일은 [최신 릴리스](https://github.com/DARC0625/taskbar-monitor/releases/latest)**에서 내려받을 수 있습니다. 소스 버전 변경이나 CI 성공이 새 릴리스의 검증·게시 완료를 뜻하지는 않습니다.
 
 [사용 안내](packaging/README.ko.txt) · [소스 빌드](BUILD.ko.md) · [자동 검사](docs/testing.md) · [실제 위젯 검사](docs/runtime-validation.md) · [호환성](docs/compatibility.md) · [보안](docs/security-testing.md) · [릴리스 절차](docs/release-process.md)
 
@@ -63,7 +63,7 @@ NPU가 없는 PC나 팬 RPM을 읽을 수 없는 PC에 가짜 `0%`·`0RPM`을 �
 
 Rust와 Windows 네이티브 API를 사용합니다. 빌드 도구, 테스트, 설치 프로그램 제작 절차는 [BUILD.ko.md](BUILD.ko.md)에 정리되어 있습니다.
 
-0.4.1 후보의 자동 검사는 Windows Server 2022/MSVC, Server 2025/MSVC, Server 2025/GNU에서 회귀 테스트와 창 없는 probe를 실행하도록 구성합니다. GNU 작업은 설치·포터블 패키지와 GitHub 호스팅 실행기 안의 설치 수명주기도 검사합니다. CodeQL과 RustSec 감사는 별도 보안 워크플로에서 수행합니다. **구성된 검사와 통과한 검사는 다릅니다.** 해당 커밋의 [Actions 결과](https://github.com/DARC0625/taskbar-monitor/actions)를 확인하세요.
+자동 검사는 Windows Server 2022/MSVC, Server 2025/MSVC, Server 2025/GNU에서 회귀 테스트와 창 없는 probe를 실행하도록 구성합니다. GNU 작업은 설치·포터블 패키지와 GitHub 호스팅 실행기 안의 설치 수명주기도 검사합니다. CodeQL과 RustSec 감사는 별도 보안 워크플로에서 수행합니다. **구성된 검사와 통과한 검사는 다릅니다.** 해당 커밋의 [Actions 결과](https://github.com/DARC0625/taskbar-monitor/actions)를 확인하세요.
 
 현재 Windows 11 x64용이며, 작업표시줄 내부 창 구조를 사용하는 방식은 공식 작업표시줄 확장 API가 아니므로 Windows 업데이트나 다른 작업표시줄 도구와의 호환성은 별도로 확인해야 합니다.
 
